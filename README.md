@@ -21,7 +21,7 @@
 - **Português, English e Español**, seguindo o idioma do sistema.
 - **Leve**: não roda nada em segundo plano; a posição da música só é consultada com o painel aberto.
 
-Requisitos: GNOME 45 a 49 (Ubuntu 24.04 ou mais novo, Fedora 39+, …).
+Requisitos: GNOME 45 a 50 (Ubuntu 24.04 ou mais novo, Fedora 39+, …).
 
 ## Instalar
 
