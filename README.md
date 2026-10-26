@@ -13,13 +13,14 @@
 
 ## O que ele faz
 
-- **Pílula no meio da barra de cima** com a capa e o nome da música, ao lado do relógio. Some quando nada está tocando.
-- **Clique para abrir** um painel escuro e translúcido com capa, artista, barra de progresso (dá para arrastar) e controles.
+- **Pílula estilo notch no meio da barra de cima**, ao lado do relógio: capa, nome da música e **barrinhas animadas na cor do álbum**, como no Mac. Some quando nada está tocando.
+- **Passe o mouse para abrir** (ou clique) um painel escuro e translúcido, **tingido com a cor da capa**: capa, artista, barra de progresso (dá para arrastar) e controles. Ele fecha sozinho quando o mouse sai.
+- **"Pulinho"** na pílula quando a música troca.
 - **Clique do meio** na pílula: play/pause sem abrir nada.
 - **Funciona com qualquer player MPRIS**: Spotify, Firefox, Chrome/Chromium, VLC, Rhythmbox, Elisa…
-- **Vários players ao mesmo tempo**: mostra o que começou a tocar por último; os ícones embaixo deixam trocar.
-- **Português, English e Español**, seguindo o idioma do sistema.
-- **Leve**: não roda nada em segundo plano; a posição da música só é consultada com o painel aberto.
+- **Vários players ao mesmo tempo**: mostra o que começou a tocar por último; os ícones ao lado dos controles deixam trocar.
+- **Ajustes** (engrenagem no painel, ou app Extensões): idioma (Sistema, Português, English, Español), abrir ao passar o mouse, mostrar o nome na pílula e o pulinho.
+- **Leve**: a posição da música só é consultada com o painel aberto, e as barrinhas só animam enquanto toca.
 
 Requisitos: GNOME 45 a 50 (Ubuntu 24.04 ou mais novo, Fedora 39+, …).
 
