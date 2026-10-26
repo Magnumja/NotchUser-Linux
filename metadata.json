@@ -2,7 +2,7 @@
   "uuid": "notchuser@magnumja.github.io",
   "name": "NotchUser",
   "description": "Your music in a pill in the middle of the top bar. Click it for cover, progress and controls. Works with Spotify, Firefox, Chrome and any MPRIS player.",
-  "shell-version": ["45", "46", "47", "48", "49"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/Magnumja/NotchUser",
   "version-name": "0.1.0"
 }
