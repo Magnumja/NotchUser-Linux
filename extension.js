@@ -11,7 +11,6 @@ import Clutter from 'gi://Clutter';
 import Graphene from 'gi://Graphene';
 import Pango from 'gi://Pango';
 import GdkPixbuf from 'gi://GdkPixbuf';
-import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -414,6 +413,8 @@ class ShelfBridge {
         if (win.get_wm_class() !== SHELF_APP_ID && win.get_title() !== 'NotchUser Shelf')
             return;
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            if (!this._extension.settings)  // the extension was turned off meanwhile
+                return GLib.SOURCE_REMOVE;
             const m = Main.layoutManager.primaryMonitor;
             const r = win.get_frame_rect();
             win.move_frame(true, m.x + Math.round((m.width - r.width) / 2), m.y + Main.panel.height + 8);
@@ -598,7 +599,12 @@ class NotchIndicator extends PanelMenu.Button {
         this._slider = new Slider.Slider(0);
         this._slider.x_expand = true;
         this._slider.add_style_class_name('notchuser-slider');
+        // GNOME's slider has no public "is dragging" flag, so track it to keep the
+        // position updates from yanking the knob while the user drags it.
+        this._sliding = false;
+        this._slider.connect('drag-begin', () => { this._sliding = true; });
         this._slider.connect('drag-end', () => {
+            this._sliding = false;
             const p = this._players.current;
             if (p?.canSeek)
                 p.seek(this._slider.value * p.length);
@@ -767,7 +773,7 @@ class NotchIndicator extends PanelMenu.Button {
         if (!(p?.length > 0))
             return;
         const pos = p.livePosition;
-        if (!this._slider.dragging)
+        if (!this._sliding)
             this._slider.value = pos / p.length;
         setText(this._elapsed, clock(pos));
         setText(this._remaining, `-${clock(p.length - pos)}`);
