@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.notchuser" path="/org/gnome/shell/extensions/notchuser/">
+    <key name="language" type="s">
+      <default>'system'</default>
+      <summary>Language: system, en, pt or es</summary>
+    </key>
+    <key name="hover-open" type="b">
+      <default>true</default>
+      <summary>Open the panel when hovering the pill</summary>
+    </key>
+    <key name="show-title" type="b">
+      <default>true</default>
+      <summary>Show the song title in the pill</summary>
+    </key>
+    <key name="bump-on-change" type="b">
+      <default>true</default>
+      <summary>Bounce the pill when the song changes</summary>
+    </key>
+  </schema>
+</schemalist>

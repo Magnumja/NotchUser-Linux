@@ -1,5 +1,6 @@
-// NotchUser for GNOME: a pill in the middle of the top bar showing what's playing,
-// with a translucent panel (cover, progress, controls, player switcher) on click.
+// NotchUser for GNOME: a black pill in the middle of the top bar showing what's playing
+// (cover, title, bars in the album's color), with a translucent panel on hover or click
+// (cover, progress, controls, player switcher). Same idea as the Mac version.
 // Music comes from MPRIS, the D-Bus standard that Spotify, browsers, VLC… all speak.
 
 import GObject from 'gi://GObject';
@@ -7,7 +8,9 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Graphene from 'gi://Graphene';
 import Pango from 'gi://Pango';
+import GdkPixbuf from 'gi://GdkPixbuf';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -15,29 +18,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
-// MARK: - Language
-
-const STRINGS = {
-    nothingPlaying: {en: 'Nothing playing', pt: 'Nada tocando', es: 'No suena nada'},
-    hint: {
-        en: 'Play something in Spotify, Firefox, Chrome…',
-        pt: 'Toque algo no Spotify, Firefox, Chrome…',
-        es: 'Reproduce algo en Spotify, Firefox, Chrome…',
-    },
-};
-
-const LANG = (() => {
-    for (const name of GLib.get_language_names()) {
-        const code = name.slice(0, 2);
-        if (['en', 'pt', 'es'].includes(code))
-            return code;
-    }
-    return 'en';
-})();
-
-function _(key) {
-    return STRINGS[key][LANG] ?? STRINGS[key].en;
-}
+import {resolveLang, tr} from './strings.js';
 
 function clock(seconds) {
     const t = Math.max(0, Math.floor(seconds));
@@ -52,6 +33,28 @@ function vbox(params) {
     else
         box.vertical = true;
     return box;
+}
+
+/** Album color, brightened so it stays visible on black (same rule as the Mac version). */
+function brighten(r, g, b) {
+    const max = Math.max(r, g, b) / 255, min = Math.min(r, g, b) / 255;
+    const d = max - min;
+    let h = 0;
+    if (d > 0) {
+        if (max === r / 255)
+            h = ((g - b) / 255 / d) % 6;
+        else if (max === g / 255)
+            h = (b - r) / 255 / d + 2;
+        else
+            h = (r - g) / 255 / d + 4;
+    }
+    h = (h * 60 + 360) % 360;
+    const s = Math.min((max === 0 ? 0 : d / max) * 1.3, 1);
+    const v = Math.max(max, 0.8);
+    const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+    const [r1, g1, b1] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+        : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    return [r1, g1, b1].map(v1 => Math.round((v1 + m) * 255));
 }
 
 // MARK: - MPRIS
@@ -86,9 +89,10 @@ const RootProxy = Gio.DBusProxy.makeProxyWrapper(`
 
 /** One MPRIS player on the session bus. */
 class Player {
-    constructor(busName, onChange) {
+    constructor(busName, onChange, onTrack) {
         this.busName = busName;
         this._onChange = onChange;
+        this._onTrack = onTrack;
         this.title = '';
         this.artist = '';
         this.artUrl = '';
@@ -97,6 +101,7 @@ class Player {
         this.playing = false;
         this.startedAt = 0;
         this.position = 0;
+        this._trackKey = '';
 
         this._root = new RootProxy(Gio.DBus.session, busName, MPRIS_PATH, (_p, error) => {
             if (!error)
@@ -124,7 +129,13 @@ class Player {
         this.artUrl = get('mpris:artUrl') ?? '';
         this.length = Number(get('mpris:length') ?? 0) / 1e6;
         this.trackId = get('mpris:trackid') ?? this.trackId;
+
+        const key = `${this.title}|${this.artist}`;
+        const changed = this._trackKey && key !== this._trackKey;
+        this._trackKey = key;
         this._onChange();
+        if (changed)
+            this._onTrack(this);
     }
 
     get name() {
@@ -170,8 +181,9 @@ class Player {
 
 /** Every MPRIS player on the bus, and which one the pill shows. */
 class Players {
-    constructor(onChange) {
+    constructor(onChange, onTrack) {
         this._onChange = onChange;
+        this._onTrack = onTrack;
         this._players = new Map();
         this._pinned = null;
         this._pinnedAt = 0;
@@ -202,7 +214,8 @@ class Players {
         // playerctld only mirrors other players; showing it would duplicate them.
         if (this._players.has(name) || name === `${MPRIS_PREFIX}playerctld`)
             return;
-        this._players.set(name, new Player(name, () => this._onChange()));
+        this._players.set(name, new Player(name, () => this._onChange(),
+            p => p === this.current && this._onTrack()));
     }
 
     _remove(name) {
@@ -260,25 +273,105 @@ function iconButton(iconName, size, styleClass, onClick) {
     return button;
 }
 
+const CENTER = new Graphene.Point({x: 0.5, y: 0.5});
+
 const NotchIndicator = GObject.registerClass(
 class NotchIndicator extends PanelMenu.Button {
-    _init(players) {
+    _init(extension) {
         super._init(0.5, 'NotchUser', false);
-        this._players = players;
+        this._extension = extension;
+        this._settings = extension.settings;
+        this._players = extension.players;
+        this._accentUrl = null;
         this.add_style_class_name('notchuser-indicator');
 
-        // The pill in the top bar.
-        const pill = new St.BoxLayout({style_class: 'notchuser-pill', y_align: Clutter.ActorAlign.CENTER});
+        this._buildPill();
+        this._buildPanel();
+
+        this._settingsIds = [
+            this._settings.connect('changed::language', () => this._applyLanguage()),
+            this._settings.connect('changed::show-title', () => this.sync()),
+        ];
+        this.menu.connect('open-state-changed', (_m, open) => this._menuToggled(open));
+        this.connect('enter-event', () => this._hoverEnter());
+        this.connect('leave-event', () => this._clearHoverDelay());
+
+        this._applyLanguage();
+        this.sync();
+    }
+
+    // MARK: Pill (the "notch" in the top bar)
+
+    _buildPill() {
+        this._pill = new St.BoxLayout({style_class: 'notchuser-pill', y_align: Clutter.ActorAlign.CENTER, pivot_point: CENTER});
         this._pillCover = new St.Icon({style_class: 'notchuser-pill-cover', icon_size: 16});
         this._pillLabel = new St.Label({style_class: 'notchuser-pill-label', y_align: Clutter.ActorAlign.CENTER});
         this._pillLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
-        this._pillState = new St.Icon({style_class: 'notchuser-pill-state', icon_size: 12});
-        pill.add_child(this._pillCover);
-        pill.add_child(this._pillLabel);
-        pill.add_child(this._pillState);
-        this.add_child(pill);
+        this._pillPause = new St.Icon({style_class: 'notchuser-pill-pause', icon_name: 'media-playback-pause-symbolic', icon_size: 12});
 
-        // The panel that drops down from it.
+        // Four little bars in the album's color, bouncing while music plays.
+        this._bars = new St.BoxLayout({style_class: 'notchuser-bars', y_align: Clutter.ActorAlign.CENTER});
+        this._barActors = [];
+        for (let i = 0; i < 4; i++) {
+            const bar = new St.Widget({style_class: 'notchuser-bar', y_align: Clutter.ActorAlign.CENTER, pivot_point: CENTER});
+            bar.scale_y = 0.35;
+            this._bars.add_child(bar);
+            this._barActors.push(bar);
+        }
+
+        this._pill.add_child(this._pillCover);
+        this._pill.add_child(this._pillLabel);
+        this._pill.add_child(this._bars);
+        this._pill.add_child(this._pillPause);
+        this.add_child(this._pill);
+    }
+
+    _setBarsPlaying(playing) {
+        if (playing === Boolean(this._barsId))
+            return;
+        if (playing) {
+            this._barsId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 170, () => {
+                for (const bar of this._barActors) {
+                    bar.ease({
+                        scale_y: 0.3 + Math.random() * 0.7,
+                        duration: 160,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
+                }
+                return GLib.SOURCE_CONTINUE;
+            });
+        } else {
+            GLib.source_remove(this._barsId);
+            this._barsId = 0;
+            for (const bar of this._barActors) {
+                bar.remove_all_transitions();
+                bar.scale_y = 0.35;
+            }
+        }
+    }
+
+    /** Quick squash-and-stretch when the song changes, like the Mac notch. */
+    bump() {
+        if (!this._settings.get_boolean('bump-on-change') || !this.container.visible)
+            return;
+        this._pill.remove_all_transitions();
+        this._pill.ease({
+            scale_x: 1.1,
+            scale_y: 1.18,
+            duration: 110,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => this._pill.ease({
+                scale_x: 1,
+                scale_y: 1,
+                duration: 420,
+                mode: Clutter.AnimationMode.EASE_OUT_ELASTIC,
+            }),
+        });
+    }
+
+    // MARK: Panel
+
+    _buildPanel() {
         this.menu.actor.add_style_class_name('notchuser-menu');
         const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
         item.add_style_class_name('notchuser-card');
@@ -286,8 +379,9 @@ class NotchIndicator extends PanelMenu.Button {
         item.add_child(card);
         this.menu.addMenuItem(item);
 
+        // Cover and title/artist.
         this._header = new St.BoxLayout({style_class: 'notchuser-header'});
-        this._cover = new St.Icon({style_class: 'notchuser-cover', icon_size: 64});
+        this._cover = new St.Icon({style_class: 'notchuser-cover', icon_size: 56});
         const coverButton = new St.Button({child: this._cover, style_class: 'notchuser-cover-button'});
         coverButton.connect('clicked', () => {
             this._players.current?.raise();
@@ -304,9 +398,10 @@ class NotchIndicator extends PanelMenu.Button {
         this._header.add_child(texts);
         card.add_child(this._header);
 
+        // Elapsed, draggable bar, remaining.
         this._progress = new St.BoxLayout({style_class: 'notchuser-progress'});
         this._elapsed = new St.Label({style_class: 'notchuser-time', y_align: Clutter.ActorAlign.CENTER});
-        this._remaining = new St.Label({style_class: 'notchuser-time', y_align: Clutter.ActorAlign.CENTER});
+        this._remaining = new St.Label({style_class: 'notchuser-time notchuser-time-end', y_align: Clutter.ActorAlign.CENTER});
         this._slider = new Slider.Slider(0);
         this._slider.x_expand = true;
         this._slider.add_style_class_name('notchuser-slider');
@@ -320,31 +415,39 @@ class NotchIndicator extends PanelMenu.Button {
         this._progress.add_child(this._remaining);
         card.add_child(this._progress);
 
-        this._controls = new St.BoxLayout({style_class: 'notchuser-controls', x_align: Clutter.ActorAlign.CENTER});
-        this._controls.add_child(iconButton('media-skip-backward-symbolic', 20, '', () => this._players.current?.previous()));
+        // Settings on the left, transport in the middle, player icons on the right (as on the Mac).
+        this._controlsRow = new St.BoxLayout({style_class: 'notchuser-controls-row', x_expand: true});
+        const left = new St.BoxLayout({style_class: 'notchuser-side', x_expand: true, x_align: Clutter.ActorAlign.START});
+        this._gear = iconButton('emblem-system-symbolic', 15, 'notchuser-gear', () => {
+            this.menu.close();
+            this._extension.openPreferences();
+        });
+        left.add_child(this._gear);
+        const controls = new St.BoxLayout({style_class: 'notchuser-controls', x_align: Clutter.ActorAlign.CENTER});
+        controls.add_child(iconButton('media-skip-backward-symbolic', 20, '', () => this._players.current?.previous()));
         this._playButton = iconButton('media-playback-start-symbolic', 26, 'notchuser-play',
             () => this._players.current?.playPause());
-        this._controls.add_child(this._playButton);
-        this._controls.add_child(iconButton('media-skip-forward-symbolic', 20, '', () => this._players.current?.next()));
-        card.add_child(this._controls);
-
-        // One icon per player; click to show it.
-        this._sources = new St.BoxLayout({style_class: 'notchuser-sources', x_align: Clutter.ActorAlign.CENTER});
-        card.add_child(this._sources);
+        controls.add_child(this._playButton);
+        controls.add_child(iconButton('media-skip-forward-symbolic', 20, '', () => this._players.current?.next()));
+        this._sources = new St.BoxLayout({style_class: 'notchuser-side notchuser-sources', x_expand: true, x_align: Clutter.ActorAlign.END});
+        this._controlsRow.add_child(left);
+        this._controlsRow.add_child(controls);
+        this._controlsRow.add_child(this._sources);
+        card.add_child(this._controlsRow);
 
         this._empty = vbox({style_class: 'notchuser-empty', x_align: Clutter.ActorAlign.CENTER});
-        this._empty.add_child(new St.Label({text: _('nothingPlaying'), style_class: 'notchuser-title'}));
-        this._empty.add_child(new St.Label({text: _('hint'), style_class: 'notchuser-artist'}));
+        this._emptyTitle = new St.Label({style_class: 'notchuser-title', x_align: Clutter.ActorAlign.CENTER});
+        this._emptyHint = new St.Label({style_class: 'notchuser-artist', x_align: Clutter.ActorAlign.CENTER});
+        this._empty.add_child(this._emptyTitle);
+        this._empty.add_child(this._emptyHint);
         card.add_child(this._empty);
+    }
 
-        this.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
-                this._startTicking();
-            else
-                this._stopTicking();
-        });
-
-        this.sync();
+    _applyLanguage() {
+        const lang = resolveLang(this._settings.get_string('language'));
+        this._emptyTitle.text = tr('nothingPlaying', lang);
+        this._emptyHint.text = tr('hint', lang);
+        this._gear.accessible_name = tr('settings', lang);
     }
 
     /** Middle-click on the pill toggles play/pause without opening the panel. */
@@ -360,17 +463,21 @@ class NotchIndicator extends PanelMenu.Button {
         const p = this._players.current;
         // Hidden while nothing is playing, like a notch with nothing to show.
         this.container.visible = Boolean(p);
-        for (const a of [this._header, this._progress, this._controls, this._sources])
+        for (const a of [this._header, this._progress, this._controlsRow])
             a.visible = Boolean(p);
         this._empty.visible = !p;
-        if (!p)
+        if (!p) {
+            this._setBarsPlaying(false);
             return;
+        }
 
         const cover = coverIcon(p.artUrl);
         this._pillCover.gicon = cover;
         this._pillLabel.text = p.title;
-        this._pillState.icon_name = 'media-playback-pause-symbolic';
-        this._pillState.visible = !p.playing;
+        this._pillLabel.visible = this._settings.get_boolean('show-title');
+        this._bars.visible = p.playing;
+        this._pillPause.visible = !p.playing;
+        this._setBarsPlaying(p.playing);
 
         this._cover.gicon = cover;
         this._title.text = p.title;
@@ -381,6 +488,43 @@ class NotchIndicator extends PanelMenu.Button {
         this._slider.reactive = p.canSeek;
         this._updateTime(p);
         this._rebuildSources(p);
+        this._loadAccent(p.artUrl);
+    }
+
+    // MARK: Album color
+
+    _loadAccent(url) {
+        if (url === this._accentUrl)
+            return;
+        this._accentUrl = url;
+        if (!url) {
+            this._setAccent(null);
+            return;
+        }
+        Gio.File.new_for_uri(url).load_contents_async(null, (file, res) => {
+            if (this._destroyed || this._accentUrl !== url)
+                return;
+            try {
+                const [, bytes] = file.load_contents_finish(res);
+                const loader = new GdkPixbuf.PixbufLoader();
+                loader.write(bytes);
+                loader.close();
+                const px = loader.get_pixbuf().scale_simple(1, 1, GdkPixbuf.InterpType.BILINEAR).get_pixels();
+                this._setAccent(brighten(px[0], px[1], px[2]));
+            } catch {
+                this._setAccent(null);
+            }
+        });
+    }
+
+    _setAccent(rgb) {
+        const [r, g, b] = rgb ?? [255, 255, 255];
+        for (const bar of this._barActors)
+            bar.style = `background-color: rgb(${r}, ${g}, ${b});`;
+        // The panel glass picks up a tint of the cover, fading into dark at the bottom.
+        this.menu.box.style = rgb
+            ? `background-gradient-direction: vertical; background-gradient-start: rgba(${r}, ${g}, ${b}, 0.28); background-gradient-end: rgba(18, 18, 22, 0.92);`
+            : null;
     }
 
     _updateTime(p) {
@@ -395,9 +539,7 @@ class NotchIndicator extends PanelMenu.Button {
 
     _rebuildSources(current) {
         this._sources.destroy_all_children();
-        const all = this._players.all;
-        this._sources.visible = all.length > 1;
-        for (const p of all) {
+        for (const p of this._players.all) {
             const selected = p === current;
             const button = new St.Button({
                 style_class: `notchuser-source${selected ? ' selected' : ''}${p.playing ? ' playing' : ''}`,
@@ -413,6 +555,61 @@ class NotchIndicator extends PanelMenu.Button {
                 }
             });
             this._sources.add_child(button);
+        }
+    }
+
+    // MARK: Hover to open (like the Mac notch)
+
+    _hoverEnter() {
+        if (!this._settings.get_boolean('hover-open') || this.menu.isOpen || this._hoverDelayId)
+            return;
+        // A short delay so passing the mouse along the top bar doesn't pop it open.
+        this._hoverDelayId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 160, () => {
+            this._hoverDelayId = 0;
+            if (this.hover && !this.menu.isOpen) {
+                this._openedByHover = true;
+                this.menu.open();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _clearHoverDelay() {
+        if (this._hoverDelayId) {
+            GLib.source_remove(this._hoverDelayId);
+            this._hoverDelayId = 0;
+        }
+    }
+
+    /** Closes a hover-opened panel once the mouse has left both the pill and the panel for a moment. */
+    _watchPointer() {
+        let outsideFor = 0;
+        this._watchId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+            const [x, y] = global.get_pointer();
+            const point = new Graphene.Point({x, y});
+            const inside = [this, this.menu.actor].some(a => a.get_transformed_extents().contains_point(point));
+            outsideFor = inside ? 0 : outsideFor + 120;
+            if (outsideFor >= 360) {
+                this._watchId = 0;
+                this.menu.close();
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _menuToggled(open) {
+        if (open) {
+            this._startTicking();
+            if (this._openedByHover)
+                this._watchPointer();
+        } else {
+            this._stopTicking();
+            this._openedByHover = false;
+            if (this._watchId) {
+                GLib.source_remove(this._watchId);
+                this._watchId = 0;
+            }
         }
     }
 
@@ -436,15 +633,22 @@ class NotchIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        this._destroyed = true;
         this._stopTicking();
+        this._clearHoverDelay();
+        this._setBarsPlaying(false);
+        if (this._watchId)
+            GLib.source_remove(this._watchId);
+        this._settingsIds.forEach(id => this._settings.disconnect(id));
         super.destroy();
     }
 });
 
 export default class NotchUserExtension extends Extension {
     enable() {
-        this._players = new Players(() => this._indicator?.sync());
-        this._indicator = new NotchIndicator(this._players);
+        this.settings = this.getSettings();
+        this.players = new Players(() => this._indicator?.sync(), () => this._indicator?.bump());
+        this._indicator = new NotchIndicator(this);
         // First slot of the center box: right next to the clock, under the camera on laptops.
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'center');
     }
@@ -452,7 +656,8 @@ export default class NotchUserExtension extends Extension {
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
-        this._players?.destroy();
-        this._players = null;
+        this.players?.destroy();
+        this.players = null;
+        this.settings = null;
     }
 }

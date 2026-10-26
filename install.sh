@@ -5,19 +5,22 @@
 set -e
 cd "$(dirname "$0")"
 UUID=notchuser@magnumja.github.io
-FILES="metadata.json extension.js stylesheet.css"
+FILES="metadata.json extension.js prefs.js strings.js stylesheet.css"
 
 if [ "${1:-}" = "pack" ]; then
+  glib-compile-schemas schemas/
   mkdir -p dist
   rm -f "dist/$UUID.zip"
-  zip -q -j "dist/$UUID.zip" $FILES
+  zip -q "dist/$UUID.zip" $FILES schemas/*.xml schemas/gschemas.compiled
   echo "ok: dist/$UUID.zip"
   exit 0
 fi
 
 DEST="$HOME/.local/share/gnome-shell/extensions/$UUID"
-mkdir -p "$DEST"
+mkdir -p "$DEST/schemas"
 cp $FILES "$DEST/"
+cp schemas/*.xml "$DEST/schemas/"
+glib-compile-schemas "$DEST/schemas/"
 gnome-extensions enable "$UUID" 2>/dev/null || true
 
 echo "NotchUser instalado em $DEST"

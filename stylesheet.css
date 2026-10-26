@@ -30,8 +30,21 @@
   color: rgba(255, 255, 255, 0.92);
 }
 
-.notchuser-pill-state {
+.notchuser-pill-pause {
   color: rgba(255, 255, 255, 0.55);
+}
+
+/* Bars in the album's color (set from the code), like the Mac notch */
+.notchuser-bars {
+  spacing: 2px;
+  padding: 0 2px;
+}
+
+.notchuser-bar {
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background-color: #ffffff;
 }
 
 /* The panel that drops down */
@@ -97,8 +110,25 @@
   color: #ffffff;
 }
 
+.notchuser-controls-row {
+  spacing: 6px;
+}
+
+.notchuser-side {
+  min-width: 80px;
+}
+
 .notchuser-controls {
-  spacing: 18px;
+  spacing: 10px;
+}
+
+.notchuser-gear {
+  padding: 6px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.notchuser-time-end {
+  text-align: right;
 }
 
 .notchuser-button {
@@ -120,7 +150,7 @@
 }
 
 .notchuser-sources {
-  spacing: 6px;
+  spacing: 2px;
 }
 
 .notchuser-source {
