@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 UUID=notchuser@magnumja.github.io
-FILES="metadata.json extension.js prefs.js strings.js stylesheet.css"
+FILES="metadata.json extension.js prefs.js strings.js shelf.js stylesheet.css"
 
 if [ "${1:-}" = "pack" ]; then
   glib-compile-schemas schemas/

@@ -11,6 +11,8 @@ import Clutter from 'gi://Clutter';
 import Graphene from 'gi://Graphene';
 import Pango from 'gi://Pango';
 import GdkPixbuf from 'gi://GdkPixbuf';
+import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -275,6 +277,119 @@ function iconButton(iconName, size, styleClass, onClick) {
 
 const CENTER = new Graphene.Point({x: 0.5, y: 0.5});
 
+/** Real frosted glass: the same blur GNOME uses for the overview and the lock screen. */
+function makeBlur() {
+    const blur = new Shell.BlurEffect({mode: Shell.BlurMode.BACKGROUND, brightness: 0.6});
+    // GNOME 46 renamed `sigma` to `radius`.
+    if ('radius' in blur)
+        blur.radius = 36;
+    else
+        blur.sigma = 18;
+    return blur;
+}
+
+// MARK: - Shelf
+
+const SHELF_APP_ID = 'io.github.magnumja.NotchUserShelf';
+const SHELF_FILE = GLib.build_filenamev([GLib.get_user_data_dir(), 'notchuser', 'shelf.json']);
+
+/**
+ * Extensions can't receive files dropped from apps, so the shelf is a small GTK window
+ * (shelf.js). This launches it, places it under the pill (on Wayland apps can't place
+ * themselves) and pops it up whenever something is dragged toward the top bar.
+ */
+class ShelfBridge {
+    constructor(extension, onCount) {
+        this._extension = extension;
+        this._onCount = onCount;
+        this.count = 0;
+
+        // The shelf saves its items to a file; watching it gives the count for the pill.
+        this._file = Gio.File.new_for_path(SHELF_FILE);
+        this._monitor = this._file.monitor_file(Gio.FileMonitorFlags.NONE, null);
+        this._monitorId = this._monitor.connect('changed', () => this._readCount());
+        this._readCount();
+
+        this._windowId = global.display.connect('window-created', (_d, win) => this._place(win));
+
+        // While any app drags something, watch where the pointer goes.
+        this._dragIds = [
+            Main.xdndHandler.connect('drag-begin', () => this._startDragWatch()),
+            Main.xdndHandler.connect('drag-end', () => this._stopDragWatch()),
+        ];
+    }
+
+    run(cmd) {
+        try {
+            Gio.Subprocess.new(['gjs', '-m', `${this._extension.path}/shelf.js`, cmd,
+                this._extension.settings.get_string('language')], Gio.SubprocessFlags.NONE);
+        } catch (e) {
+            console.error(`NotchUser: could not start the shelf: ${e}`);
+        }
+    }
+
+    _readCount() {
+        let count = 0;
+        try {
+            const [, bytes] = this._file.load_contents(null);
+            count = JSON.parse(new TextDecoder().decode(bytes)).length;
+        } catch {
+            // No shelf file yet.
+        }
+        const grew = count > this.count;
+        this.count = count;
+        this._onCount(grew);
+    }
+
+    _startDragWatch() {
+        this._stopDragWatch();
+        let peeked = false;
+        this._dragWatchId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            const [x, y] = global.get_pointer();
+            const m = Main.layoutManager.primaryMonitor;
+            // Near the pill, but well before the very top edge.
+            const near = y < m.y + Main.panel.height + 220 && Math.abs(x - (m.x + m.width / 2)) < 340;
+            if (near && !peeked) {
+                peeked = true;
+                this.run('peek');
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopDragWatch() {
+        if (this._dragWatchId) {
+            GLib.source_remove(this._dragWatchId);
+            this._dragWatchId = 0;
+        }
+    }
+
+    _place(win) {
+        if (win.get_wm_class() !== SHELF_APP_ID && win.get_title() !== 'NotchUser Shelf')
+            return;
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            const m = Main.layoutManager.primaryMonitor;
+            const r = win.get_frame_rect();
+            win.move_frame(true, m.x + Math.round((m.width - r.width) / 2), m.y + Main.panel.height + 8);
+            win.make_above();
+            win.stick();
+            const actor = win.get_compositor_private();
+            if (actor && this._extension.settings.get_boolean('blur') && !actor.get_effect('notchuser-blur'))
+                actor.add_effect_with_name('notchuser-blur', makeBlur());
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    destroy() {
+        this._stopDragWatch();
+        this._dragIds.forEach(id => Main.xdndHandler.disconnect(id));
+        global.display.disconnect(this._windowId);
+        this._monitor.disconnect(this._monitorId);
+        this._monitor.cancel();
+        this.run('quit');
+    }
+}
+
 const NotchIndicator = GObject.registerClass(
 class NotchIndicator extends PanelMenu.Button {
     _init(extension) {
@@ -291,6 +406,7 @@ class NotchIndicator extends PanelMenu.Button {
         this._settingsIds = [
             this._settings.connect('changed::language', () => this._applyLanguage()),
             this._settings.connect('changed::show-title', () => this.sync()),
+            this._settings.connect('changed::blur', () => this._applyBlur()),
         ];
         this.menu.connect('open-state-changed', (_m, open) => this._menuToggled(open));
         this.connect('enter-event', () => this._hoverEnter());
@@ -323,6 +439,13 @@ class NotchIndicator extends PanelMenu.Button {
         this._pill.add_child(this._pillLabel);
         this._pill.add_child(this._bars);
         this._pill.add_child(this._pillPause);
+
+        // Nothing playing but things on the shelf: a tray and the count, like the Mac notch.
+        this._pillShelf = new St.BoxLayout({style_class: 'notchuser-pill-shelf', y_align: Clutter.ActorAlign.CENTER});
+        this._pillShelf.add_child(new St.Icon({icon_name: 'folder-symbolic', icon_size: 13}));
+        this._pillShelfCount = new St.Label({y_align: Clutter.ActorAlign.CENTER});
+        this._pillShelf.add_child(this._pillShelfCount);
+        this._pill.add_child(this._pillShelf);
         this.add_child(this._pill);
     }
 
@@ -367,6 +490,25 @@ class NotchIndicator extends PanelMenu.Button {
                 mode: Clutter.AnimationMode.EASE_OUT_ELASTIC,
             }),
         });
+    }
+
+    /** A little shake when something lands on the shelf (Linux laptops can't vibrate). */
+    wiggle() {
+        if (!this.container.visible)
+            return;
+        const steps = [6, -6, 4, -4, 2, 0];
+        let i = 0;
+        const next = () => {
+            if (i < steps.length) {
+                this._pill.ease({
+                    translation_x: steps[i++],
+                    duration: 45,
+                    mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+                    onComplete: next,
+                });
+            }
+        };
+        next();
     }
 
     // MARK: Panel
@@ -422,6 +564,11 @@ class NotchIndicator extends PanelMenu.Button {
             this.menu.close();
             this._extension.openPreferences();
         });
+        this._shelfButton = iconButton('folder-symbolic', 15, 'notchuser-gear', () => {
+            this.menu.close();
+            this._extension.shelf.run('toggle');
+        });
+        left.add_child(this._shelfButton);
         left.add_child(this._gear);
         const controls = new St.BoxLayout({style_class: 'notchuser-controls', x_align: Clutter.ActorAlign.CENTER});
         controls.add_child(iconButton('media-skip-backward-symbolic', 20, '', () => this._players.current?.previous()));
@@ -440,7 +587,30 @@ class NotchIndicator extends PanelMenu.Button {
         this._emptyHint = new St.Label({style_class: 'notchuser-artist', x_align: Clutter.ActorAlign.CENTER});
         this._empty.add_child(this._emptyTitle);
         this._empty.add_child(this._emptyHint);
+        this._emptyShelf = new St.Button({style_class: 'notchuser-empty-button', x_align: Clutter.ActorAlign.CENTER});
+        this._emptyShelf.connect('clicked', () => {
+            this.menu.close();
+            this._extension.shelf.run('show');
+        });
+        this._empty.add_child(this._emptyShelf);
         card.add_child(this._empty);
+
+        this._applyBlur();
+    }
+
+    /** Frosted glass behind the panel; the tint gets lighter so the blur shows through. */
+    _applyBlur() {
+        const on = this._settings.get_boolean('blur');
+        const has = Boolean(this.menu.box.get_effect('notchuser-blur'));
+        if (on && !has)
+            this.menu.box.add_effect_with_name('notchuser-blur', makeBlur());
+        else if (!on && has)
+            this.menu.box.remove_effect_by_name('notchuser-blur');
+        if (on)
+            this.menu.actor.add_style_class_name('notchuser-blurred');
+        else
+            this.menu.actor.remove_style_class_name('notchuser-blurred');
+        this._setAccent(this._accentRGB ?? null);
     }
 
     _applyLanguage() {
@@ -448,6 +618,8 @@ class NotchIndicator extends PanelMenu.Button {
         this._emptyTitle.text = tr('nothingPlaying', lang);
         this._emptyHint.text = tr('hint', lang);
         this._gear.accessible_name = tr('settings', lang);
+        this._shelfButton.accessible_name = tr('shelf', lang);
+        this._emptyShelf.label = tr('openShelf', lang);
     }
 
     /** Middle-click on the pill toggles play/pause without opening the panel. */
@@ -461,15 +633,21 @@ class NotchIndicator extends PanelMenu.Button {
 
     sync() {
         const p = this._players.current;
-        // Hidden while nothing is playing, like a notch with nothing to show.
-        this.container.visible = Boolean(p);
+        const shelfCount = this._extension.shelf?.count ?? 0;
+        // Hidden while there's nothing to show, like an empty notch.
+        this.container.visible = Boolean(p) || shelfCount > 0;
         for (const a of [this._header, this._progress, this._controlsRow])
             a.visible = Boolean(p);
         this._empty.visible = !p;
+        this._pillShelf.visible = !p && shelfCount > 0;
+        this._pillShelfCount.text = String(shelfCount);
+        for (const a of [this._pillCover, this._pillLabel, this._bars, this._pillPause])
+            a.visible = Boolean(p);
         if (!p) {
             this._setBarsPlaying(false);
             return;
         }
+        this._pillCover.visible = true;
 
         const cover = coverIcon(p.artUrl);
         this._pillCover.gicon = cover;
@@ -518,12 +696,14 @@ class NotchIndicator extends PanelMenu.Button {
     }
 
     _setAccent(rgb) {
+        this._accentRGB = rgb;
         const [r, g, b] = rgb ?? [255, 255, 255];
+        const end = this._settings.get_boolean('blur') ? 0.5 : 0.92;
         for (const bar of this._barActors)
             bar.style = `background-color: rgb(${r}, ${g}, ${b});`;
         // The panel glass picks up a tint of the cover, fading into dark at the bottom.
         this.menu.box.style = rgb
-            ? `background-gradient-direction: vertical; background-gradient-start: rgba(${r}, ${g}, ${b}, 0.28); background-gradient-end: rgba(18, 18, 22, 0.92);`
+            ? `background-gradient-direction: vertical; background-gradient-start: rgba(${r}, ${g}, ${b}, 0.28); background-gradient-end: rgba(18, 18, 22, ${end});`
             : null;
     }
 
@@ -648,6 +828,11 @@ export default class NotchUserExtension extends Extension {
     enable() {
         this.settings = this.getSettings();
         this.players = new Players(() => this._indicator?.sync(), () => this._indicator?.bump());
+        this.shelf = new ShelfBridge(this, grew => {
+            this._indicator?.sync();
+            if (grew)
+                this._indicator?.wiggle();
+        });
         this._indicator = new NotchIndicator(this);
         // First slot of the center box: right next to the clock, under the camera on laptops.
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'center');
@@ -658,6 +843,8 @@ export default class NotchUserExtension extends Extension {
         this._indicator = null;
         this.players?.destroy();
         this.players = null;
+        this.shelf?.destroy();
+        this.shelf = null;
         this.settings = null;
     }
 }

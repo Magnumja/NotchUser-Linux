@@ -15,7 +15,9 @@
 
 - **Pílula estilo notch no meio da barra de cima**, ao lado do relógio: capa, nome da música e **barrinhas animadas na cor do álbum**, como no Mac. Some quando nada está tocando.
 - **Passe o mouse para abrir** (ou clique) um painel escuro e translúcido, **tingido com a cor da capa**: capa, artista, barra de progresso (dá para arrastar) e controles. Ele fecha sozinho quando o mouse sai.
-- **"Pulinho"** na pílula quando a música troca.
+- **"Pulinho"** na pílula quando a música troca, e uma **tremidinha** quando algo chega na prateleira.
+- **Prateleira.** Arraste arquivos, links ou texto em direção à barra de cima: uma prateleira de vidro aparece logo abaixo da pílula com "Solte aqui pra guardar". Depois é só arrastar de volta para onde quiser. Clique para selecionar vários e arrastar todos juntos; dois cliques abrem (texto é copiado). Também abre pelo ícone de pasta no painel.
+- **Vidro fosco de verdade**: o painel e a prateleira desfocam o que está atrás, com o mesmo efeito da Visão Geral do GNOME (dá para desligar nos Ajustes).
 - **Clique do meio** na pílula: play/pause sem abrir nada.
 - **Funciona com qualquer player MPRIS**: Spotify, Firefox, Chrome/Chromium, VLC, Rhythmbox, Elisa…
 - **Vários players ao mesmo tempo**: mostra o que começou a tocar por último; os ícones ao lado dos controles deixam trocar.

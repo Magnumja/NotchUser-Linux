@@ -15,6 +15,13 @@ const STRINGS = {
     hoverOpen: {en: 'Open when hovering the pill', pt: 'Abrir ao passar o mouse na pílula', es: 'Abrir al pasar el ratón por la píldora'},
     showTitle: {en: 'Show the song title in the pill', pt: 'Mostrar o nome da música na pílula', es: 'Mostrar el nombre de la canción en la píldora'},
     bump: {en: 'Bounce when the song changes', pt: 'Dar um pulinho quando a música trocar', es: 'Dar un saltito al cambiar de canción'},
+    shelf: {en: 'Shelf', pt: 'Prateleira', es: 'Estante'},
+    openShelf: {en: 'Open the shelf', pt: 'Abrir a prateleira', es: 'Abrir el estante'},
+    dropHere: {en: 'Drop here to keep it', pt: 'Solte aqui pra guardar', es: 'Suelta aquí para guardarlo'},
+    releaseNow: {en: 'Drop it', pt: 'Pode soltar', es: 'Suéltalo'},
+    clearShelf: {en: 'Clear shelf', pt: 'Limpar prateleira', es: 'Vaciar estante'},
+    removeSelected: {en: 'Remove the selected', pt: 'Tirar os selecionados', es: 'Quitar los seleccionados'},
+    blurGlass: {en: 'Frosted glass blur (experimental)', pt: 'Desfoque de vidro (experimental)', es: 'Desenfoque de vidrio (experimental)'},
     reopenHint: {
         en: 'Language changes apply to this window the next time it opens.',
         pt: 'A troca de idioma vale para esta janela na próxima vez que ela abrir.',

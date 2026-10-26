@@ -174,3 +174,29 @@
   spacing: 4px;
   padding: 10px 0;
 }
+
+/* Shelf count in the pill when nothing is playing */
+.notchuser-pill-shelf {
+  spacing: 4px;
+  font-size: 0.9em;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+/* With the real blur on, the glass is lighter so what's behind shows through */
+.notchuser-menu.notchuser-blurred .popup-menu-content {
+  background-color: rgba(18, 18, 22, 0.5);
+}
+
+.notchuser-empty-button {
+  margin-top: 8px;
+  padding: 6px 14px;
+  border-radius: 99px;
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.notchuser-empty-button:hover {
+  background-color: rgba(255, 255, 255, 0.18);
+}

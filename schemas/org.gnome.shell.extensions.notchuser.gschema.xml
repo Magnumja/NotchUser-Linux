@@ -13,6 +13,10 @@
       <default>true</default>
       <summary>Show the song title in the pill</summary>
     </key>
+    <key name="blur" type="b">
+      <default>true</default>
+      <summary>Blur what is behind the panel and the shelf</summary>
+    </key>
     <key name="bump-on-change" type="b">
       <default>true</default>
       <summary>Bounce the pill when the song changes</summary>
