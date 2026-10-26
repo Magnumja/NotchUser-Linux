@@ -22,6 +22,12 @@ import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {resolveLang, tr} from './strings.js';
 
+/** Setting a label to the text it already has still costs a relayout; skip it. */
+function setText(label, text) {
+    if (label.text !== text)
+        label.text = text;
+}
+
 function clock(seconds) {
     const t = Math.max(0, Math.floor(seconds));
     return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
@@ -103,6 +109,7 @@ class Player {
         this.playing = false;
         this.startedAt = 0;
         this.position = 0;
+        this.positionAt = 0;
         this._trackKey = '';
 
         this._root = new RootProxy(Gio.DBus.session, busName, MPRIS_PATH, (_p, error) => {
@@ -162,6 +169,7 @@ class Player {
                 try {
                     const [v] = conn.call_finish(res).deepUnpack();
                     this.position = Number(v.deepUnpack()) / 1e6;
+                    this.positionAt = GLib.get_monotonic_time();
                     callback(this.position);
                 } catch {
                     // Some players don't report a position; the bar just stays put.
@@ -172,7 +180,17 @@ class Player {
     playPause() { this._player?.PlayPauseRemote(); }
     next() { this._player?.NextRemote(); }
     previous() { this._player?.PreviousRemote(); }
-    seek(seconds) { this._player?.SetPositionRemote(this.trackId, Math.round(seconds * 1e6)); }
+    seek(seconds) {
+        this._player?.SetPositionRemote(this.trackId, Math.round(seconds * 1e6));
+        this.position = seconds;
+        this.positionAt = GLib.get_monotonic_time();
+    }
+
+    /** Where the song is now, moving on from the last read while it plays. */
+    get livePosition() {
+        const elapsed = this.playing && this.positionAt ? (GLib.get_monotonic_time() - this.positionAt) / 1e6 : 0;
+        return Math.min(this.position + elapsed, this.length || Infinity);
+    }
     raise() { this._root?.RaiseRemote(); }
 
     destroy() {
@@ -291,6 +309,7 @@ function makeBlur() {
 // MARK: - Shelf
 
 const SHELF_APP_ID = 'io.github.magnumja.NotchUserShelf';
+const SHELF_PATH = '/io/github/magnumja/NotchUserShelf';
 const SHELF_FILE = GLib.build_filenamev([GLib.get_user_data_dir(), 'notchuser', 'shelf.json']);
 
 /**
@@ -312,6 +331,19 @@ class ShelfBridge {
 
         this._windowId = global.display.connect('window-created', (_d, win) => this._place(win));
 
+        // Once the shelf runs, commands go straight to it over D-Bus (instant) instead of
+        // starting a new gjs process each time.
+        this._running = false;
+        this._busWatchId = Gio.bus_watch_name(Gio.BusType.SESSION, SHELF_APP_ID, Gio.BusNameWatcherFlags.NONE,
+            () => {
+                this._running = true;
+                this._starting = false;
+            },
+            () => {
+                this._running = false;
+                this._actions = null;
+            });
+
         // While any app drags something, watch where the pointer goes.
         this._dragIds = [
             Main.xdndHandler.connect('drag-begin', () => this._startDragWatch()),
@@ -320,9 +352,14 @@ class ShelfBridge {
     }
 
     run(cmd) {
+        const lang = this._extension.settings.get_string('language');
+        if (this._running) {
+            this._actions ??= Gio.DBusActionGroup.get(Gio.DBus.session, SHELF_APP_ID, SHELF_PATH);
+            this._actions.activate_action(cmd, new GLib.Variant('s', lang));
+            return;
+        }
         try {
-            Gio.Subprocess.new(['gjs', '-m', `${this._extension.path}/shelf.js`, cmd,
-                this._extension.settings.get_string('language')], Gio.SubprocessFlags.NONE);
+            Gio.Subprocess.new(['gjs', '-m', `${this._extension.path}/shelf.js`, cmd, lang], Gio.SubprocessFlags.NONE);
         } catch (e) {
             console.error(`NotchUser: could not start the shelf: ${e}`);
         }
@@ -341,8 +378,17 @@ class ShelfBridge {
         this._onCount(grew);
     }
 
+    /** Start the shelf hidden as soon as a drag begins, so it's ready by the time it's needed. */
+    _prewarm() {
+        if (!this._running && !this._starting) {
+            this._starting = true;
+            this.run('start');
+        }
+    }
+
     _startDragWatch() {
         this._stopDragWatch();
+        this._prewarm();
         let peeked = false;
         this._dragWatchId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             const [x, y] = global.get_pointer();
@@ -386,7 +432,9 @@ class ShelfBridge {
         global.display.disconnect(this._windowId);
         this._monitor.disconnect(this._monitorId);
         this._monitor.cancel();
-        this.run('quit');
+        if (this._running)
+            this.run('quit');
+        Gio.bus_unwatch_name(this._busWatchId);
     }
 }
 
@@ -453,12 +501,15 @@ class NotchIndicator extends PanelMenu.Button {
         if (playing === Boolean(this._barsId))
             return;
         if (playing) {
-            this._barsId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 170, () => {
+            // Each ease lasts exactly one interval, so the bars never stop between steps.
+            this._barsId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 240, () => {
+                if (Main.sessionMode.isLocked || global.display.get_monitor_in_fullscreen(Main.layoutManager.primaryIndex))
+                    return GLib.SOURCE_CONTINUE;
                 for (const bar of this._barActors) {
                     bar.ease({
                         scale_y: 0.3 + Math.random() * 0.7,
-                        duration: 160,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        duration: 240,
+                        mode: Clutter.AnimationMode.EASE_IN_OUT_SINE,
                     });
                 }
                 return GLib.SOURCE_CONTINUE;
@@ -640,7 +691,7 @@ class NotchIndicator extends PanelMenu.Button {
             a.visible = Boolean(p);
         this._empty.visible = !p;
         this._pillShelf.visible = !p && shelfCount > 0;
-        this._pillShelfCount.text = String(shelfCount);
+        setText(this._pillShelfCount, String(shelfCount));
         for (const a of [this._pillCover, this._pillLabel, this._bars, this._pillPause])
             a.visible = Boolean(p);
         if (!p) {
@@ -649,17 +700,21 @@ class NotchIndicator extends PanelMenu.Button {
         }
         this._pillCover.visible = true;
 
-        const cover = coverIcon(p.artUrl);
-        this._pillCover.gicon = cover;
-        this._pillLabel.text = p.title;
+        // A new icon object makes St reload the texture, so only swap it when the art changes.
+        if (p.artUrl !== this._shownArt) {
+            this._shownArt = p.artUrl;
+            const cover = coverIcon(p.artUrl);
+            this._pillCover.gicon = cover;
+            this._cover.gicon = cover;
+        }
+        setText(this._pillLabel, p.title);
         this._pillLabel.visible = this._settings.get_boolean('show-title');
         this._bars.visible = p.playing;
         this._pillPause.visible = !p.playing;
         this._setBarsPlaying(p.playing);
 
-        this._cover.gicon = cover;
-        this._title.text = p.title;
-        this._artist.text = p.artist;
+        setText(this._title, p.title);
+        setText(this._artist, p.artist);
         this._artist.visible = Boolean(p.artist);
         this._playButton.child.icon_name = p.playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic';
         this._progress.visible = p.length > 0;
@@ -685,6 +740,7 @@ class NotchIndicator extends PanelMenu.Button {
             try {
                 const [, bytes] = file.load_contents_finish(res);
                 const loader = new GdkPixbuf.PixbufLoader();
+                loader.connect('size-prepared', l => l.set_size(16, 16));
                 loader.write(bytes);
                 loader.close();
                 const px = loader.get_pixbuf().scale_simple(1, 1, GdkPixbuf.InterpType.BILINEAR).get_pixels();
@@ -710,16 +766,21 @@ class NotchIndicator extends PanelMenu.Button {
     _updateTime(p) {
         if (!(p?.length > 0))
             return;
-        const pos = Math.min(p.position, p.length);
+        const pos = p.livePosition;
         if (!this._slider.dragging)
             this._slider.value = pos / p.length;
-        this._elapsed.text = clock(pos);
-        this._remaining.text = `-${clock(p.length - pos)}`;
+        setText(this._elapsed, clock(pos));
+        setText(this._remaining, `-${clock(p.length - pos)}`);
     }
 
     _rebuildSources(current) {
+        const all = this._players.all;
+        const signature = all.map(p => `${p.busName}:${p === current}:${p.playing}`).join('|');
+        if (signature === this._sourcesSignature)
+            return;
+        this._sourcesSignature = signature;
         this._sources.destroy_all_children();
-        for (const p of this._players.all) {
+        for (const p of all) {
             const selected = p === current;
             const button = new St.Button({
                 style_class: `notchuser-source${selected ? ' selected' : ''}${p.playing ? ' playing' : ''}`,
@@ -794,15 +855,21 @@ class NotchIndicator extends PanelMenu.Button {
     }
 
     // Position is only polled while the panel is open: nothing runs in the background.
+    // The bar glides 4 times a second from the last known position; the player itself is
+    // only asked every 2 seconds to correct any drift.
     _startTicking() {
         this._stopTicking();
+        let n = 0;
         const tick = () => {
             const p = this._players.current;
-            p?.fetchPosition(() => this._updateTime(p));
+            if (p && n++ % 8 === 0)
+                p.fetchPosition(() => this._updateTime(p));
+            else
+                this._updateTime(p);
             return GLib.SOURCE_CONTINUE;
         };
         tick();
-        this._tickId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, tick);
+        this._tickId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, tick);
     }
 
     _stopTicking() {

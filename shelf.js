@@ -2,7 +2,8 @@
 // GNOME Shell extensions can't receive files dropped from apps, so this small GTK app does
 // it instead. The extension shows it under the pill when a drag heads for the top bar and
 // places it there (on Wayland only the shell can position windows).
-// Usage: gjs -m shelf.js [show|peek|hide|toggle|quit] [system|en|pt|es]
+// Usage: gjs -m shelf.js [show|peek|hide|toggle|start|quit] [system|en|pt|es]
+// Once running, the same commands are app actions on D-Bus (the extension uses those).
 import Gtk from 'gi://Gtk?version=4.0';
 import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
@@ -99,6 +100,8 @@ class ShelfWindow {
         this.pointerInside = false;
         this.peeking = false;
         this.hideId = 0;
+        this.widgets = new Map();  // key -> item widget, rebuilt only when the items change
+        this.itemsDirty = true;
 
         this.win = new Gtk.ApplicationWindow({
             application: app,
@@ -181,6 +184,7 @@ class ShelfWindow {
                 this.items.push(e);
         }
         save(this.items);
+        this.itemsDirty = true;
         this.render();
         if (this.peeking)
             this.scheduleHide(2500);
@@ -200,11 +204,20 @@ class ShelfWindow {
         this.dropLabel.visible = n === 0 || this.hovering;
         this.scroller.visible = n > 0 && !this.hovering;
 
+        // Hovering a drag over the shelf only swaps the labels above; the items (and their
+        // thumbnails, read from disk) are rebuilt only when the list itself changed.
+        if (!this.itemsDirty)
+            return;
+        this.itemsDirty = false;
         let child;
         while ((child = this.row.get_first_child()))
             this.row.remove(child);
-        for (const e of this.items)
-            this.row.append(this.itemWidget(e));
+        this.widgets.clear();
+        for (const e of this.items) {
+            const w = this.itemWidget(e);
+            this.widgets.set(key(e), w);
+            this.row.append(w);
+        }
     }
 
     itemWidget(e) {
@@ -278,10 +291,14 @@ class ShelfWindow {
 
     toggle(e) {
         const k = key(e);
-        if (this.selected.has(k))
+        const w = this.widgets.get(k);
+        if (this.selected.has(k)) {
             this.selected.delete(k);
-        else
+            w?.remove_css_class('selected');
+        } else {
             this.selected.add(k);
+            w?.add_css_class('selected');
+        }
         this.render();
     }
 
@@ -298,12 +315,17 @@ class ShelfWindow {
         this.items = this.selected.size ? this.items.filter(i => !this.selected.has(key(i))) : [];
         this.selected.clear();
         save(this.items);
+        this.itemsDirty = true;
         this.render();
     }
 
     show(peek) {
         this.peeking = peek;
-        this.items = load();
+        const items = load();
+        if (JSON.stringify(items) !== JSON.stringify(this.items)) {
+            this.items = items;
+            this.itemsDirty = true;
+        }
         this.render();
         this.win.present();
         if (peek) {
@@ -342,13 +364,22 @@ app.connect('startup', () => {
         css.load_from_data(CSS, -1);
     Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
     app.hold();  // stay alive while hidden, so the next show is instant
+
+    // The extension sends commands as actions on D-Bus, with the language as parameter.
+    for (const name of ['show', 'peek', 'hide', 'toggle', 'start', 'quit']) {
+        const action = new Gio.SimpleAction({name, parameter_type: new GLib.VariantType('s')});
+        action.connect('activate', (_a, param) => handle(name, param?.unpack() ?? 'system'));
+        app.add_action(action);
+    }
 });
 
-app.connect('command-line', (_app, cmdline) => {
-    const [, cmd = 'show', lang = 'system'] = cmdline.get_arguments();
+function handle(cmd, lang) {
     shelf ??= new ShelfWindow(app, resolveLang(lang));
     shelf.lang = resolveLang(lang);
     switch (cmd) {
+    case 'start':
+        // Just get ready (window built, nothing shown) so the first peek is instant.
+        break;
     case 'peek':
         shelf.show(true);
         break;
@@ -368,6 +399,11 @@ app.connect('command-line', (_app, cmdline) => {
     default:
         shelf.show(false);
     }
+}
+
+app.connect('command-line', (_app, cmdline) => {
+    const [, cmd = 'show', lang = 'system'] = cmdline.get_arguments();
+    handle(cmd, lang);
     return 0;
 });
 
