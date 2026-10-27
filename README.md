@@ -9,7 +9,7 @@
 
 ---
 
-> A versão para Mac está em [Magnumja/NotchUser](https://github.com/Magnumja/NotchUser).
+> Versão para Mac: [Magnumja/NotchUser](https://github.com/Magnumja/NotchUser) · Windows: [Magnumja/NotchUser-Windows](https://github.com/Magnumja/NotchUser-Windows)
 
 ## O que ele faz
 
