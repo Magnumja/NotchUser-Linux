@@ -27,7 +27,7 @@ export default class NotchUserPreferences extends ExtensionPreferences {
         page.add(languageGroup);
 
         const behaviorGroup = new Adw.PreferencesGroup({title: t('behavior')});
-        for (const [key, label] of [['hover-open', 'hoverOpen'], ['show-title', 'showTitle'], ['bump-on-change', 'bump'], ['blur', 'blurGlass']]) {
+        for (const [key, label] of [['hover-open', 'hoverOpen'], ['show-title', 'showTitle'], ['animate-bars', 'animateBars'], ['bump-on-change', 'bump'], ['blur', 'blurGlass']]) {
             const row = new Adw.SwitchRow({title: t(label)});
             settings.bind(key, row, 'active', Gio.SettingsBindFlags.DEFAULT);
             behaviorGroup.add(row);

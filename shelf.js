@@ -26,6 +26,7 @@ try {
 const APP_ID = 'io.github.magnumja.NotchUserShelf';
 const DATA_DIR = GLib.build_filenamev([GLib.get_user_data_dir(), 'notchuser']);
 const DATA_FILE = GLib.build_filenamev([DATA_DIR, 'shelf.json']);
+const IDLE_QUIT_SECONDS = 5 * 60;
 
 const CSS = `
 window.notchuser-shelf { background: transparent; }
@@ -35,8 +36,15 @@ window.notchuser-shelf { background: transparent; }
   border: 1px solid rgba(255, 255, 255, 0.14);
   padding: 12px;
   color: white;
+  transform-origin: top;
+  transition: background-color 180ms ease-out, border-color 180ms ease-out;
 }
 .shelf.drop-hover { border-color: rgba(255, 255, 255, 0.6); background-color: rgba(40, 40, 48, 0.72); }
+/* Puffs out of the top bar like the panel does (two names so it can restart each time). */
+.shelf.appear-a { animation: shelf-in-a 300ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+.shelf.appear-b { animation: shelf-in-b 300ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+@keyframes shelf-in-a { from { opacity: 0; transform: translateY(-16px) scale(0.86, 0.7); } to { opacity: 1; transform: none; } }
+@keyframes shelf-in-b { from { opacity: 0; transform: translateY(-16px) scale(0.86, 0.7); } to { opacity: 1; transform: none; } }
 .shelf-title { font-weight: 700; font-size: 0.9em; color: rgba(255, 255, 255, 0.7); }
 .drop-zone {
   border: 1.5px dashed rgba(255, 255, 255, 0.35);
@@ -44,10 +52,20 @@ window.notchuser-shelf { background: transparent; }
   padding: 16px;
   color: rgba(255, 255, 255, 0.7);
   font-weight: 600;
+  transition: border-color 160ms ease-out, background-color 160ms ease-out,
+    transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.drop-hover .drop-zone { border-color: rgba(255, 255, 255, 0.85); color: white; }
+.drop-hover .drop-zone {
+  border-color: rgba(255, 255, 255, 0.85);
+  background-color: rgba(255, 255, 255, 0.08);
+  color: white;
+  transform: scale(1.02);
+}
 .drop-count { font-size: 0.8em; font-weight: 400; color: rgba(255, 255, 255, 0.55); }
-.item { border-radius: 10px; padding: 4px; }
+.item { border-radius: 10px; padding: 4px; transition: background-color 150ms ease-out, box-shadow 150ms ease-out; }
+.item-new { animation: item-pop 320ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+@keyframes item-pop { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: none; } }
+.item-leaving { opacity: 0; transform: scale(0.7); transition: opacity 160ms ease-in, transform 160ms ease-in; }
 .item:hover { background-color: rgba(255, 255, 255, 0.08); }
 .item.selected { background-color: rgba(53, 132, 228, 0.35); box-shadow: inset 0 0 0 1.5px rgba(53, 132, 228, 0.9); }
 .item-label { font-size: 0.75em; color: rgba(255, 255, 255, 0.8); }
@@ -174,15 +192,21 @@ function loadPreview(path, image) {
 // MARK: - Window
 
 class ShelfWindow {
-    constructor(app, lang) {
+    constructor(app, lang, onIdle) {
         this.lang = lang;
+        this.onIdle = onIdle;
+        this.idleQuitId = 0;
         this.items = load();
         this.selected = new Set();
         this.hovering = false;
         this.pointerInside = false;
         this.peeking = false;
         this.hideId = 0;
-        this.widgets = new Map();  // key -> item widget, rebuilt only when the items change
+        this.cells = new Map();    // key -> entry in the row (a revealer around box and ×)
+        this.leaving = new Set();  // entries shrinking away, still in the row for a moment
+        this.filled = false;
+        this.appearFlip = false;
+        this.widgets = new Map();  // key -> the entry's box, which shows the selection
         this.itemsDirty = true;
         this.menuEntries = [];
 
@@ -253,8 +277,27 @@ class ShelfWindow {
         motion.connect('leave', () => { this.pointerInside = false; });
         this.win.add_controller(motion);
 
+        // Left hidden for a while, the shelf quits to give its memory back; the extension
+        // starts it again (already when a drag begins) the next time it's needed.
+        this.win.connect('notify::visible', () => this.armIdleQuit());
+
         this.buildMenu();
         this.render();
+        this.armIdleQuit();  // a prewarmed shelf may never be shown at all
+    }
+
+    armIdleQuit() {
+        if (this.idleQuitId) {
+            GLib.source_remove(this.idleQuitId);
+            this.idleQuitId = 0;
+        }
+        if (this.win.visible)
+            return;
+        this.idleQuitId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, IDLE_QUIT_SECONDS, () => {
+            this.idleQuitId = 0;
+            this.onIdle();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     accept(value) {
@@ -301,17 +344,79 @@ class ShelfWindow {
         this.dropZone.visible = n === 0 || this.hovering;
         this.scroller.visible = n > 0 && !this.hovering;
 
-        // Hovering a drag over the shelf only swaps the labels above; the items (and their
-        // thumbnails, read from disk) are rebuilt only when the list itself changed.
+        // Hovering a drag over the shelf only swaps the labels above. When the list changes,
+        // only the entries that came or went are touched: the others keep their widgets
+        // (and thumbnails), so adding one file to a full shelf doesn't redo them all.
         if (!this.itemsDirty)
             return;
         this.itemsDirty = false;
+        const wanted = new Set(this.items.map(key));
+        for (const [k, cell] of this.cells) {
+            if (!wanted.has(k)) {
+                this.cells.delete(k);
+                this.widgets.delete(k);
+                this.collapse(cell);
+            }
+        }
+        // The first fill (opening the shelf) appears at once; later arrivals pop in.
+        const animate = this.filled;
+        this.filled = true;
+        let previous = null;
+        for (const e of this.items) {
+            let cell = this.cells.get(key(e));
+            if (!cell) {
+                cell = new Gtk.Revealer({
+                    child: this.itemWidget(e),
+                    transition_type: Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                    transition_duration: 220,
+                    reveal_child: !animate,
+                });
+                this.cells.set(key(e), cell);
+                this.row.insert_child_after(cell, previous);
+                if (animate) {
+                    cell.child.add_css_class('item-new');
+                    cell.reveal_child = true;  // neighbours slide apart while it pops in
+                }
+            } else if (this.liveSibling(cell) !== previous) {
+                this.row.reorder_child_after(cell, previous);
+            }
+            previous = cell;
+        }
+    }
+
+    /** The entry before `cell`, skipping ones still shrinking away. */
+    liveSibling(cell) {
+        let sibling = cell.get_prev_sibling();
+        while (sibling && this.leaving.has(sibling))
+            sibling = sibling.get_prev_sibling();
+        return sibling;
+    }
+
+    /** Shrinks an entry away and closes the gap, then drops it. */
+    collapse(cell) {
+        this.leaving.add(cell);
+        cell.child.add_css_class('item-leaving');
+        cell.connect('notify::child-revealed', () => {
+            if (cell.child_revealed)
+                return;
+            this.leaving.delete(cell);
+            if (cell.get_parent() === this.row)
+                this.row.remove(cell);
+        });
+        cell.reveal_child = false;
+    }
+
+    /** Drops every entry widget, for when their texts must change (another language). */
+    rebuild() {
         let child;
         while ((child = this.row.get_first_child()))
             this.row.remove(child);
+        this.leaving.clear();
+        this.cells.clear();
         this.widgets.clear();
-        for (const e of this.items)
-            this.row.append(this.itemWidget(e));
+        this.filled = false;
+        this.itemsDirty = true;
+        this.render();
     }
 
     preview(e) {
@@ -542,7 +647,14 @@ class ShelfWindow {
             this.itemsDirty = true;
         }
         this.render();
+        const appearing = !this.win.visible;
         this.win.present();
+        if (appearing) {
+            // A new animation name restarts it, so alternate between two identical ones.
+            this.appearFlip = !this.appearFlip;
+            this.root.remove_css_class(this.appearFlip ? 'appear-b' : 'appear-a');
+            this.root.add_css_class(this.appearFlip ? 'appear-a' : 'appear-b');
+        }
         if (peek) {
             this.scheduleHide(4000);
         } else if (this.hideId) {
@@ -588,9 +700,22 @@ app.connect('startup', () => {
     }
 });
 
+// Idle and the extension's own "quit" can both arrive; the hold must be released once.
+let quitting = false;
+function quit() {
+    if (quitting)
+        return;
+    quitting = true;
+    app.release();
+    app.quit();
+}
+
 function handle(cmd, lang) {
-    shelf ??= new ShelfWindow(app, resolveLang(lang));
-    shelf.lang = resolveLang(lang);
+    shelf ??= new ShelfWindow(app, resolveLang(lang), quit);
+    if (shelf.lang !== resolveLang(lang)) {
+        shelf.lang = resolveLang(lang);
+        shelf.rebuild();
+    }
     switch (cmd) {
     case 'start':
         // Just get ready (window built, nothing shown) so the first peek is instant.
@@ -608,8 +733,7 @@ function handle(cmd, lang) {
             shelf.show(false);
         break;
     case 'quit':
-        app.release();
-        app.quit();
+        quit();
         break;
     default:
         shelf.show(false);
