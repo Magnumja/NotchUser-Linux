@@ -21,6 +21,19 @@ const STRINGS = {
     releaseNow: {en: 'Drop it', pt: 'Pode soltar', es: 'Suéltalo'},
     clearShelf: {en: 'Clear shelf', pt: 'Limpar prateleira', es: 'Vaciar estante'},
     removeSelected: {en: 'Remove the selected', pt: 'Tirar os selecionados', es: 'Quitar los seleccionados'},
+    alreadyOnShelf: {en: '%d already on the shelf', pt: '%d já na prateleira', es: '%d ya en el estante'},
+    // Shelf item menu
+    text: {en: 'Text', pt: 'Texto', es: 'Texto'},
+    open: {en: 'Open', pt: 'Abrir', es: 'Abrir'},
+    openN: {en: 'Open %d items', pt: 'Abrir %d itens', es: 'Abrir %d elementos'},
+    copyText: {en: 'Copy text', pt: 'Copiar texto', es: 'Copiar texto'},
+    showInFolder: {en: 'Show in folder', pt: 'Mostrar na pasta', es: 'Mostrar en la carpeta'},
+    copy: {en: 'Copy', pt: 'Copiar', es: 'Copiar'},
+    copyN: {en: 'Copy %d items', pt: 'Copiar %d itens', es: 'Copiar %d elementos'},
+    selectAll: {en: 'Select all', pt: 'Selecionar tudo', es: 'Seleccionar todo'},
+    deselect: {en: 'Deselect', pt: 'Desmarcar', es: 'Deseleccionar'},
+    removeFromShelf: {en: 'Remove from shelf', pt: 'Tirar da prateleira', es: 'Quitar del estante'},
+    removeN: {en: 'Remove %d from shelf', pt: 'Tirar %d da prateleira', es: 'Quitar %d del estante'},
     blurGlass: {en: 'Frosted glass blur (experimental)', pt: 'Desfoque de vidro (experimental)', es: 'Desenfoque de vidrio (experimental)'},
     reopenHint: {
         en: 'Language changes apply to this window the next time it opens.',
@@ -43,6 +56,8 @@ export function resolveLang(setting) {
     return 'en';
 }
 
-export function tr(key, lang) {
-    return STRINGS[key]?.[lang] ?? STRINGS[key]?.en ?? key;
+/** `n` fills the `%d` of texts that carry a count ("Copy %d items"). */
+export function tr(key, lang, n) {
+    const s = STRINGS[key]?.[lang] ?? STRINGS[key]?.en ?? key;
+    return n === undefined ? s : s.replace('%d', String(n));
 }
