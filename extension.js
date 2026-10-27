@@ -11,6 +11,7 @@ import Clutter from 'gi://Clutter';
 import Graphene from 'gi://Graphene';
 import Pango from 'gi://Pango';
 import GdkPixbuf from 'gi://GdkPixbuf';
+import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -18,6 +19,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 
 import {resolveLang, tr} from './strings.js';
 
@@ -323,9 +325,11 @@ class ShelfBridge {
         this.count = 0;
 
         // The shelf saves its items to a file; watching it gives the count for the pill.
+        // Read async: the shell's main loop must never wait on the disk.
+        this._cancellable = new Gio.Cancellable();
         this._file = Gio.File.new_for_path(SHELF_FILE);
         this._monitor = this._file.monitor_file(Gio.FileMonitorFlags.NONE, null);
-        this._monitorId = this._monitor.connect('changed', () => this._readCount());
+        this._monitorId = this._monitor.connect('changed', () => this._scheduleRead());
         this._readCount();
 
         this._windowId = global.display.connect('window-created', (_d, win) => this._place(win));
@@ -357,24 +361,53 @@ class ShelfBridge {
             this._actions.activate_action(cmd, new GLib.Variant('s', lang));
             return;
         }
+        const argv = ['gjs', '-m', `${this._extension.path}/shelf.js`, cmd, lang];
+        // GNOME 49+: start it as the shell's own Wayland client, so its window is recognised
+        // for sure (not by its title) and can be kept out of Alt+Tab.
+        if (Meta.WaylandClient?.new_subprocess) {
+            try {
+                this._client = Meta.WaylandClient.new_subprocess(global.context, new Gio.SubprocessLauncher(), argv);
+                return;
+            } catch (e) {
+                console.error(`NotchUser: could not start the shelf as a Wayland client: ${e}`);
+            }
+        }
+        this._client = null;
         try {
-            Gio.Subprocess.new(['gjs', '-m', `${this._extension.path}/shelf.js`, cmd, lang], Gio.SubprocessFlags.NONE);
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
         } catch (e) {
             console.error(`NotchUser: could not start the shelf: ${e}`);
         }
     }
 
+    /** Saving the shelf fires several file events in a row; read once they settle. */
+    _scheduleRead() {
+        if (this._readId)
+            GLib.source_remove(this._readId);
+        this._readId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            this._readId = 0;
+            this._readCount();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _readCount() {
-        let count = 0;
-        try {
-            const [, bytes] = this._file.load_contents(null);
-            count = JSON.parse(new TextDecoder().decode(bytes)).length;
-        } catch {
-            // No shelf file yet.
-        }
-        const grew = count > this.count;
-        this.count = count;
-        this._onCount(grew);
+        this._file.load_contents_async(this._cancellable, (file, res) => {
+            let count = 0;
+            try {
+                const [, bytes] = file.load_contents_finish(res);
+                count = JSON.parse(new TextDecoder().decode(bytes)).length;
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                // No shelf file yet.
+            }
+            // The first read is what was already there at login, not something landing now.
+            const grew = this._counted && count > this.count;
+            this._counted = true;
+            this.count = count;
+            this._onCount(grew);
+        });
     }
 
     /** Start the shelf hidden as soon as a drag begins, so it's ready by the time it's needed. */
@@ -388,15 +421,14 @@ class ShelfBridge {
     _startDragWatch() {
         this._stopDragWatch();
         this._prewarm();
-        let peeked = false;
         this._dragWatchId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             const [x, y] = global.get_pointer();
             const m = Main.layoutManager.primaryMonitor;
-            // Near the pill, but well before the very top edge.
-            const near = y < m.y + Main.panel.height + 220 && Math.abs(x - (m.x + m.width / 2)) < 340;
-            if (near && !peeked) {
-                peeked = true;
+            // Near the pill, but well before the very top edge. Once it's shown, stop watching.
+            if (y < m.y + Main.panel.height + 220 && Math.abs(x - (m.x + m.width / 2)) < 340) {
+                this._dragWatchId = 0;
                 this.run('peek');
+                return GLib.SOURCE_REMOVE;
             }
             return GLib.SOURCE_CONTINUE;
         });
@@ -410,16 +442,21 @@ class ShelfBridge {
     }
 
     _place(win) {
-        if (win.get_wm_class() !== SHELF_APP_ID && win.get_title() !== 'NotchUser Shelf')
+        const ours = this._client
+            ? this._client.owns_window(win)
+            : win.get_wm_class() === SHELF_APP_ID || win.get_title() === 'NotchUser Shelf';
+        if (!ours)
             return;
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            if (!this._extension.settings)  // the extension was turned off meanwhile
-                return GLib.SOURCE_REMOVE;
+        if (this._placeId)
+            GLib.source_remove(this._placeId);
+        this._placeId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._placeId = 0;
             const m = Main.layoutManager.primaryMonitor;
             const r = win.get_frame_rect();
             win.move_frame(true, m.x + Math.round((m.width - r.width) / 2), m.y + Main.panel.height + 8);
             win.make_above();
             win.stick();
+            win.hide_from_window_list?.();  // GNOME 49+: not in Alt+Tab or the dash
             const actor = win.get_compositor_private();
             if (actor && this._extension.settings.get_boolean('blur') && !actor.get_effect('notchuser-blur'))
                 actor.add_effect_with_name('notchuser-blur', makeBlur());
@@ -429,6 +466,11 @@ class ShelfBridge {
 
     destroy() {
         this._stopDragWatch();
+        if (this._readId)
+            GLib.source_remove(this._readId);
+        if (this._placeId)
+            GLib.source_remove(this._placeId);
+        this._cancellable.cancel();
         this._dragIds.forEach(id => Main.xdndHandler.disconnect(id));
         global.display.disconnect(this._windowId);
         this._monitor.disconnect(this._monitorId);
@@ -447,19 +489,29 @@ class NotchIndicator extends PanelMenu.Button {
         this._settings = extension.settings;
         this._players = extension.players;
         this._accentUrl = null;
+        this._pillRest = 1;  // the pill's scale when nothing is bouncing it (bigger under the mouse)
         this.add_style_class_name('notchuser-indicator');
 
         this._buildPill();
         this._buildPanel();
+        this._listenMiddleClick();
 
         this._settingsIds = [
             this._settings.connect('changed::language', () => this._applyLanguage()),
             this._settings.connect('changed::show-title', () => this.sync()),
             this._settings.connect('changed::blur', () => this._applyBlur()),
+            this._settings.connect('changed::animate-bars', () => this.sync()),
         ];
+        this._animationsId = St.Settings.get().connect('notify::enable-animations', () => this.sync());
         this.menu.connect('open-state-changed', (_m, open) => this._menuToggled(open));
-        this.connect('enter-event', () => this._hoverEnter());
-        this.connect('leave-event', () => this._clearHoverDelay());
+        this.connect('enter-event', () => {
+            this._growPill(true);
+            this._hoverEnter();
+        });
+        this.connect('leave-event', () => {
+            this._growPill(false);
+            this._clearHoverDelay();
+        });
 
         this._applyLanguage();
         this.sync();
@@ -498,13 +550,24 @@ class NotchIndicator extends PanelMenu.Button {
         this.add_child(this._pill);
     }
 
-    _setBarsPlaying(playing) {
-        if (playing === Boolean(this._barsId))
+    /**
+     * 'animated' while music plays; 'still' (fixed, uneven heights) when animations are off,
+     * in GNOME or in our settings; 'rest' when paused. A moving bar means the compositor
+     * redraws the top bar every frame, so it only moves when it's worth it.
+     */
+    _setBars(state) {
+        if (state === this._barsState)
             return;
-        if (playing) {
+        this._barsState = state;
+        if (this._barsId) {
+            GLib.source_remove(this._barsId);
+            this._barsId = 0;
+        }
+        if (state === 'animated') {
             // Each ease lasts exactly one interval, so the bars never stop between steps.
             this._barsId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 240, () => {
-                if (Main.sessionMode.isLocked || global.display.get_monitor_in_fullscreen(Main.layoutManager.primaryIndex))
+                if (Main.sessionMode.isLocked || Main.overview.visible ||
+                    global.display.get_monitor_in_fullscreen(Main.layoutManager.primaryIndex))
                     return GLib.SOURCE_CONTINUE;
                 for (const bar of this._barActors) {
                     bar.ease({
@@ -515,14 +578,20 @@ class NotchIndicator extends PanelMenu.Button {
                 }
                 return GLib.SOURCE_CONTINUE;
             });
-        } else {
-            GLib.source_remove(this._barsId);
-            this._barsId = 0;
-            for (const bar of this._barActors) {
-                bar.remove_all_transitions();
-                bar.scale_y = 0.35;
-            }
+            return;
         }
+        const heights = state === 'still' ? [0.55, 0.95, 0.7, 0.85] : [0.35, 0.35, 0.35, 0.35];
+        this._barActors.forEach((bar, i) => {
+            bar.remove_all_transitions();
+            bar.scale_y = heights[i];
+        });
+    }
+
+    _barsStateFor(playing) {
+        if (!playing)
+            return 'rest';
+        const animate = this._settings.get_boolean('animate-bars') && St.Settings.get().enable_animations;
+        return animate ? 'animated' : 'still';
     }
 
     /** Quick squash-and-stretch when the song changes, like the Mac notch. */
@@ -536,11 +605,67 @@ class NotchIndicator extends PanelMenu.Button {
             duration: 110,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => this._pill.ease({
-                scale_x: 1,
-                scale_y: 1,
+                scale_x: this._pillRest,
+                scale_y: this._pillRest,
                 duration: 420,
                 mode: Clutter.AnimationMode.EASE_OUT_ELASTIC,
             }),
+        });
+    }
+
+    /** The pill swells a little under the mouse, so it feels like it's about to open. */
+    _growPill(hovered) {
+        this._pillRest = hovered ? 1.06 : 1;
+        this._pill.ease({
+            scale_x: this._pillRest,
+            scale_y: this._pillRest,
+            duration: hovered ? 220 : 180,
+            mode: hovered ? Clutter.AnimationMode.EASE_OUT_BACK : Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
+    }
+
+    /**
+     * The panel puffs out of the pill like a cloud: it grows from the top center with a
+     * soft overshoot while it fades in, then its rows follow one after the other.
+     */
+    _animateIn() {
+        const box = this.menu.box;
+        box.remove_all_transitions();
+        box.set_pivot_point(0.5, 0);
+        box.set({scale_x: 0.78, scale_y: 0.6, opacity: 0});
+        box.ease({
+            scale_x: 1,
+            scale_y: 1,
+            opacity: 255,
+            duration: 320,
+            mode: Clutter.AnimationMode.EASE_OUT_BACK,
+        });
+        const rows = [this._header, this._progress, this._controlsRow, this._empty].filter(a => a.visible);
+        rows.forEach((row, i) => {
+            row.remove_all_transitions();
+            row.set({opacity: 0, translation_y: -8});
+            row.ease({
+                opacity: 255,
+                translation_y: 0,
+                delay: 70 + i * 45,
+                duration: 240,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        });
+    }
+
+    /** The reverse puff: shrinks back into the pill, then the menu really closes. */
+    _closeSmooth() {
+        const box = this.menu.box;
+        box.remove_all_transitions();
+        box.set_pivot_point(0.5, 0);
+        box.ease({
+            scale_x: 0.85,
+            scale_y: 0.7,
+            opacity: 0,
+            duration: 160,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+            onComplete: () => this.menu.close(),
         });
     }
 
@@ -579,7 +704,7 @@ class NotchIndicator extends PanelMenu.Button {
         const coverButton = new St.Button({child: this._cover, style_class: 'notchuser-cover-button'});
         coverButton.connect('clicked', () => {
             this._players.current?.raise();
-            this.menu.close();
+            this.menu.close(BoxPointer.PopupAnimation.FULL);
         });
         const texts = vbox({style_class: 'notchuser-texts', y_align: Clutter.ActorAlign.CENTER, x_expand: true});
         this._title = new St.Label({style_class: 'notchuser-title'});
@@ -618,11 +743,11 @@ class NotchIndicator extends PanelMenu.Button {
         this._controlsRow = new St.BoxLayout({style_class: 'notchuser-controls-row', x_expand: true});
         const left = new St.BoxLayout({style_class: 'notchuser-side', x_expand: true, x_align: Clutter.ActorAlign.START});
         this._gear = iconButton('emblem-system-symbolic', 15, 'notchuser-gear', () => {
-            this.menu.close();
+            this.menu.close(BoxPointer.PopupAnimation.FULL);
             this._extension.openPreferences();
         });
         this._shelfButton = iconButton('folder-symbolic', 15, 'notchuser-gear', () => {
-            this.menu.close();
+            this.menu.close(BoxPointer.PopupAnimation.FULL);
             this._extension.shelf.run('toggle');
         });
         left.add_child(this._shelfButton);
@@ -646,7 +771,7 @@ class NotchIndicator extends PanelMenu.Button {
         this._empty.add_child(this._emptyHint);
         this._emptyShelf = new St.Button({style_class: 'notchuser-empty-button', x_align: Clutter.ActorAlign.CENTER});
         this._emptyShelf.connect('clicked', () => {
-            this.menu.close();
+            this.menu.close(BoxPointer.PopupAnimation.FULL);
             this._extension.shelf.run('show');
         });
         this._empty.add_child(this._emptyShelf);
@@ -680,12 +805,25 @@ class NotchIndicator extends PanelMenu.Button {
     }
 
     /** Middle-click on the pill toggles play/pause without opening the panel. */
-    vfunc_event(event) {
-        if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === Clutter.BUTTON_MIDDLE) {
+    _listenMiddleClick() {
+        if (this._clickGesture) {
+            // GNOME 49+: the panel button opens its menu from a click gesture (there is no
+            // event vfunc to override any more). Keep that one for the left button and give
+            // the middle button its own gesture.
+            this._clickGesture.set_required_button(Clutter.BUTTON_PRIMARY);
+            const middle = new Clutter.ClickGesture({recognize_on_press: true});
+            middle.set_required_button(Clutter.BUTTON_MIDDLE);
+            middle.connect('recognize', () => this._players.current?.playPause());
+            this.add_action(middle);
+            return;
+        }
+        // Older GNOME: catch it on the way in, before the button toggles the menu.
+        this.connect('captured-event', (_a, event) => {
+            if (event.type() !== Clutter.EventType.BUTTON_PRESS || event.get_button() !== Clutter.BUTTON_MIDDLE)
+                return Clutter.EVENT_PROPAGATE;
             this._players.current?.playPause();
             return Clutter.EVENT_STOP;
-        }
-        return super.vfunc_event(event);
+        });
     }
 
     sync() {
@@ -701,7 +839,7 @@ class NotchIndicator extends PanelMenu.Button {
         for (const a of [this._pillCover, this._pillLabel, this._bars, this._pillPause])
             a.visible = Boolean(p);
         if (!p) {
-            this._setBarsPlaying(false);
+            this._setBars('rest');
             return;
         }
         this._pillCover.visible = true;
@@ -717,7 +855,7 @@ class NotchIndicator extends PanelMenu.Button {
         this._pillLabel.visible = this._settings.get_boolean('show-title');
         this._bars.visible = p.playing;
         this._pillPause.visible = !p.playing;
-        this._setBarsPlaying(p.playing);
+        this._setBars(this._barsStateFor(p.playing));
 
         setText(this._title, p.title);
         setText(this._artist, p.artist);
@@ -736,15 +874,23 @@ class NotchIndicator extends PanelMenu.Button {
         if (url === this._accentUrl)
             return;
         this._accentUrl = url;
+        // A newer cover (or the panel going away) cancels the read still in flight.
+        this._accentCancellable?.cancel();
         if (!url) {
             this._setAccent(null);
             return;
         }
-        Gio.File.new_for_uri(url).load_contents_async(null, (file, res) => {
-            if (this._destroyed || this._accentUrl !== url)
-                return;
+        this._accentCancellable = new Gio.Cancellable();
+        Gio.File.new_for_uri(url).load_contents_async(this._accentCancellable, (file, res) => {
+            let bytes;
             try {
-                const [, bytes] = file.load_contents_finish(res);
+                [, bytes] = file.load_contents_finish(res);
+            } catch (e) {
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    this._setAccent(null);
+                return;
+            }
+            try {
                 const loader = new GdkPixbuf.PixbufLoader();
                 loader.connect('size-prepared', l => l.set_size(16, 16));
                 loader.write(bytes);
@@ -796,7 +942,7 @@ class NotchIndicator extends PanelMenu.Button {
             button.connect('clicked', () => {
                 if (selected) {
                     p.raise();
-                    this.menu.close();
+                    this.menu.close(BoxPointer.PopupAnimation.FULL);
                 } else {
                     this._players.pin(p);
                 }
@@ -838,7 +984,7 @@ class NotchIndicator extends PanelMenu.Button {
             outsideFor = inside ? 0 : outsideFor + 120;
             if (outsideFor >= 360) {
                 this._watchId = 0;
-                this.menu.close();
+                this._closeSmooth();
                 return GLib.SOURCE_REMOVE;
             }
             return GLib.SOURCE_CONTINUE;
@@ -847,6 +993,7 @@ class NotchIndicator extends PanelMenu.Button {
 
     _menuToggled(open) {
         if (open) {
+            this._animateIn();
             this._startTicking();
             if (this._openedByHover)
                 this._watchPointer();
@@ -886,13 +1033,14 @@ class NotchIndicator extends PanelMenu.Button {
     }
 
     destroy() {
-        this._destroyed = true;
+        this._accentCancellable?.cancel();
         this._stopTicking();
         this._clearHoverDelay();
-        this._setBarsPlaying(false);
+        this._setBars('rest');
         if (this._watchId)
             GLib.source_remove(this._watchId);
         this._settingsIds.forEach(id => this._settings.disconnect(id));
+        St.Settings.get().disconnect(this._animationsId);
         super.destroy();
     }
 });

@@ -17,6 +17,10 @@
       <default>true</default>
       <summary>Blur what is behind the panel and the shelf</summary>
     </key>
+    <key name="animate-bars" type="b">
+      <default>true</default>
+      <summary>Animate the bars in the pill while music plays</summary>
+    </key>
     <key name="bump-on-change" type="b">
       <default>true</default>
       <summary>Bounce the pill when the song changes</summary>

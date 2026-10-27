@@ -9,14 +9,24 @@ import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Graphene from 'gi://Graphene';
 import Pango from 'gi://Pango';
 import System from 'system';
 
 import {resolveLang, tr} from './strings.js';
 
+// Thumbnails for files that were never previewed, made by the same generator Files uses.
+let GnomeDesktop = null;
+try {
+    GnomeDesktop = (await import('gi://GnomeDesktop?version=4.0')).default;
+} catch {
+    // Without it, those files keep their type icon.
+}
+
 const APP_ID = 'io.github.magnumja.NotchUserShelf';
 const DATA_DIR = GLib.build_filenamev([GLib.get_user_data_dir(), 'notchuser']);
 const DATA_FILE = GLib.build_filenamev([DATA_DIR, 'shelf.json']);
+const IDLE_QUIT_SECONDS = 5 * 60;
 
 const CSS = `
 window.notchuser-shelf { background: transparent; }
@@ -26,8 +36,15 @@ window.notchuser-shelf { background: transparent; }
   border: 1px solid rgba(255, 255, 255, 0.14);
   padding: 12px;
   color: white;
+  transform-origin: top;
+  transition: background-color 180ms ease-out, border-color 180ms ease-out;
 }
 .shelf.drop-hover { border-color: rgba(255, 255, 255, 0.6); background-color: rgba(40, 40, 48, 0.72); }
+/* Puffs out of the top bar like the panel does (two names so it can restart each time). */
+.shelf.appear-a { animation: shelf-in-a 300ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+.shelf.appear-b { animation: shelf-in-b 300ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+@keyframes shelf-in-a { from { opacity: 0; transform: translateY(-16px) scale(0.86, 0.7); } to { opacity: 1; transform: none; } }
+@keyframes shelf-in-b { from { opacity: 0; transform: translateY(-16px) scale(0.86, 0.7); } to { opacity: 1; transform: none; } }
 .shelf-title { font-weight: 700; font-size: 0.9em; color: rgba(255, 255, 255, 0.7); }
 .drop-zone {
   border: 1.5px dashed rgba(255, 255, 255, 0.35);
@@ -35,12 +52,35 @@ window.notchuser-shelf { background: transparent; }
   padding: 16px;
   color: rgba(255, 255, 255, 0.7);
   font-weight: 600;
+  transition: border-color 160ms ease-out, background-color 160ms ease-out,
+    transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.drop-hover .drop-zone { border-color: rgba(255, 255, 255, 0.85); color: white; }
-.item { border-radius: 10px; padding: 4px; }
+.drop-hover .drop-zone {
+  border-color: rgba(255, 255, 255, 0.85);
+  background-color: rgba(255, 255, 255, 0.08);
+  color: white;
+  transform: scale(1.02);
+}
+.drop-count { font-size: 0.8em; font-weight: 400; color: rgba(255, 255, 255, 0.55); }
+.item { border-radius: 10px; padding: 4px; transition: background-color 150ms ease-out, box-shadow 150ms ease-out; }
+.item-new { animation: item-pop 320ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+@keyframes item-pop { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: none; } }
+.item-leaving { opacity: 0; transform: scale(0.7); transition: opacity 160ms ease-in, transform 160ms ease-in; }
 .item:hover { background-color: rgba(255, 255, 255, 0.08); }
 .item.selected { background-color: rgba(53, 132, 228, 0.35); box-shadow: inset 0 0 0 1.5px rgba(53, 132, 228, 0.9); }
 .item-label { font-size: 0.75em; color: rgba(255, 255, 255, 0.8); }
+.text-card {
+  background-color: rgba(255, 255, 255, 0.92);
+  color: rgba(0, 0, 0, 0.75);
+  border-radius: 6px;
+  padding: 3px;
+  font-size: 5.5pt;
+}
+.item-remove {
+  min-height: 18px; min-width: 18px; padding: 0;
+  border: none; box-shadow: none; border-radius: 99px;
+  background-color: rgba(0, 0, 0, 0.65); color: white;
+}
 .flat-btn {
   background: none; border: none; box-shadow: none;
   color: rgba(255, 255, 255, 0.6);
@@ -51,25 +91,29 @@ window.notchuser-shelf { background: transparent; }
 
 // MARK: - Storage (shared with the extension, which shows the count in the pill)
 
-function load() {
-    try {
-        const [, bytes] = GLib.file_get_contents(DATA_FILE);
-        const items = JSON.parse(new TextDecoder().decode(bytes));
-        // Files moved or deleted elsewhere drop off the shelf.
-        return items.filter(e => e.kind !== 'file' || GLib.file_test(e.value, GLib.FileTest.EXISTS));
-    } catch {
-        return [];
-    }
-}
-
 function save(items) {
     GLib.mkdir_with_parents(DATA_DIR, 0o755);
     GLib.file_set_contents(DATA_FILE, JSON.stringify(items));
 }
 
+function load() {
+    let items;
+    try {
+        const [, bytes] = GLib.file_get_contents(DATA_FILE);
+        items = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+        return [];
+    }
+    // Files moved or deleted elsewhere drop off the shelf (and the pill's count).
+    const kept = items.filter(e => e.kind !== 'file' || GLib.file_test(e.value, GLib.FileTest.EXISTS));
+    if (kept.length !== items.length)
+        save(kept);
+    return kept;
+}
+
 const key = e => `${e.kind}:${e.value}`;
 
-function title(e) {
+function title(e, lang) {
     if (e.kind === 'file')
         return GLib.path_get_basename(e.value);
     if (e.kind === 'link') {
@@ -79,7 +123,7 @@ function title(e) {
             return e.value;
         }
     }
-    return e.value.trim().split('\n')[0] || 'Text';
+    return e.value.trim().split('\n')[0] || tr('text', lang);
 }
 
 function stringValue(text) {
@@ -89,19 +133,82 @@ function stringValue(text) {
     return v;
 }
 
+// MARK: - Thumbnails
+
+const thumbnailer = GnomeDesktop
+    ? GnomeDesktop.DesktopThumbnailFactory.new(GnomeDesktop.DesktopThumbnailSize.NORMAL)
+    : null;
+
+/**
+ * Puts the file's preview in `image`: its type icon right away, then the cached thumbnail,
+ * or a freshly generated one. All of it async, so a full shelf opens without a stall.
+ */
+function loadPreview(path, image) {
+    const file = Gio.File.new_for_path(path);
+    file.query_info_async('standard::icon,standard::content-type,time::modified,thumbnail::path',
+        Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null, (_f, res) => {
+            let info;
+            try {
+                info = file.query_info_finish(res);
+            } catch {
+                return;
+            }
+            const cached = info.get_attribute_byte_string('thumbnail::path');
+            if (cached) {
+                image.set_from_file(cached);
+                return;
+            }
+            image.set_from_gicon(info.get_icon());
+
+            const uri = file.get_uri();
+            const mime = info.get_content_type();
+            const mtime = info.get_modification_date_time()?.to_unix() ?? 0;
+            if (!thumbnailer || !mime || !thumbnailer.can_thumbnail(uri, mime, mtime) ||
+                thumbnailer.has_valid_failed_thumbnail(uri, mtime))
+                return;
+            thumbnailer.generate_thumbnail_async(uri, mime, null, (_t, genRes) => {
+                let pixbuf;
+                try {
+                    pixbuf = thumbnailer.generate_thumbnail_finish(genRes);
+                } catch {
+                    // Remember the failure so it isn't retried every time the shelf opens.
+                    thumbnailer.create_failed_thumbnail_async(uri, mtime, null, null);
+                    return;
+                }
+                thumbnailer.save_thumbnail_async(pixbuf, uri, mtime, null, (_s, saveRes) => {
+                    try {
+                        thumbnailer.save_thumbnail_finish(saveRes);
+                        const saved = thumbnailer.lookup(uri, mtime);
+                        if (saved)
+                            image.set_from_file(saved);
+                    } catch {
+                        // The type icon stays.
+                    }
+                });
+            });
+        });
+}
+
 // MARK: - Window
 
 class ShelfWindow {
-    constructor(app, lang) {
+    constructor(app, lang, onIdle) {
         this.lang = lang;
+        this.onIdle = onIdle;
+        this.idleQuitId = 0;
         this.items = load();
         this.selected = new Set();
         this.hovering = false;
         this.pointerInside = false;
         this.peeking = false;
         this.hideId = 0;
-        this.widgets = new Map();  // key -> item widget, rebuilt only when the items change
+        this.cells = new Map();    // key -> entry in the row (a revealer around box and ×)
+        this.leaving = new Set();  // entries shrinking away, still in the row for a moment
+        this.filled = false;
+        this.appearFlip = false;
+        this.widgets = new Map();  // key -> the entry's box, which shows the selection
         this.itemsDirty = true;
+        this.menuEntries = [];
 
         this.win = new Gtk.ApplicationWindow({
             application: app,
@@ -126,7 +233,13 @@ class ShelfWindow {
         header.append(this.trash);
         header.append(close);
 
-        this.dropLabel = new Gtk.Label({css_classes: ['drop-zone'], hexpand: true});
+        // While something is carried in: "Drop here", plus how many are already kept.
+        this.dropZone = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 2, hexpand: true, css_classes: ['drop-zone']});
+        this.dropLabel = new Gtk.Label();
+        this.dropCount = new Gtk.Label({css_classes: ['drop-count']});
+        this.dropZone.append(this.dropLabel);
+        this.dropZone.append(this.dropCount);
+
         this.scroller = new Gtk.ScrolledWindow({
             hscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
             vscrollbar_policy: Gtk.PolicyType.NEVER,
@@ -136,7 +249,7 @@ class ShelfWindow {
         this.scroller.set_child(this.row);
 
         this.root.append(header);
-        this.root.append(this.dropLabel);
+        this.root.append(this.dropZone);
         this.root.append(this.scroller);
         this.win.set_child(this.root);
 
@@ -164,7 +277,27 @@ class ShelfWindow {
         motion.connect('leave', () => { this.pointerInside = false; });
         this.win.add_controller(motion);
 
+        // Left hidden for a while, the shelf quits to give its memory back; the extension
+        // starts it again (already when a drag begins) the next time it's needed.
+        this.win.connect('notify::visible', () => this.armIdleQuit());
+
+        this.buildMenu();
         this.render();
+        this.armIdleQuit();  // a prewarmed shelf may never be shown at all
+    }
+
+    armIdleQuit() {
+        if (this.idleQuitId) {
+            GLib.source_remove(this.idleQuitId);
+            this.idleQuitId = 0;
+        }
+        if (this.win.visible)
+            return;
+        this.idleQuitId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, IDLE_QUIT_SECONDS, () => {
+            this.idleQuitId = 0;
+            this.onIdle();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     accept(value) {
@@ -183,15 +316,20 @@ class ShelfWindow {
             if (!this.items.some(i => key(i) === key(e)))
                 this.items.push(e);
         }
-        save(this.items);
-        this.itemsDirty = true;
-        this.render();
+        this.commit();
         if (this.peeking)
             this.scheduleHide(2500);
     }
 
+    /** Saves the items (the extension watches the file for its count) and redraws them. */
+    commit() {
+        save(this.items);
+        this.itemsDirty = true;
+        this.render();
+    }
+
     render() {
-        const t = k => tr(k, this.lang);
+        const t = (k, n) => tr(k, this.lang, n);
         const n = this.items.length;
         this.titleLabel.label = n ? `${t('shelf')} · ${n}` : t('shelf');
         this.trash.visible = n > 0 && !this.hovering;
@@ -201,23 +339,108 @@ class ShelfWindow {
         else
             this.root.remove_css_class('drop-hover');
         this.dropLabel.label = this.hovering ? t('releaseNow') : t('dropHere');
-        this.dropLabel.visible = n === 0 || this.hovering;
+        this.dropCount.label = t('alreadyOnShelf', n);
+        this.dropCount.visible = this.hovering && n > 0;
+        this.dropZone.visible = n === 0 || this.hovering;
         this.scroller.visible = n > 0 && !this.hovering;
 
-        // Hovering a drag over the shelf only swaps the labels above; the items (and their
-        // thumbnails, read from disk) are rebuilt only when the list itself changed.
+        // Hovering a drag over the shelf only swaps the labels above. When the list changes,
+        // only the entries that came or went are touched: the others keep their widgets
+        // (and thumbnails), so adding one file to a full shelf doesn't redo them all.
         if (!this.itemsDirty)
             return;
         this.itemsDirty = false;
+        const wanted = new Set(this.items.map(key));
+        for (const [k, cell] of this.cells) {
+            if (!wanted.has(k)) {
+                this.cells.delete(k);
+                this.widgets.delete(k);
+                this.collapse(cell);
+            }
+        }
+        // The first fill (opening the shelf) appears at once; later arrivals pop in.
+        const animate = this.filled;
+        this.filled = true;
+        let previous = null;
+        for (const e of this.items) {
+            let cell = this.cells.get(key(e));
+            if (!cell) {
+                cell = new Gtk.Revealer({
+                    child: this.itemWidget(e),
+                    transition_type: Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                    transition_duration: 220,
+                    reveal_child: !animate,
+                });
+                this.cells.set(key(e), cell);
+                this.row.insert_child_after(cell, previous);
+                if (animate) {
+                    cell.child.add_css_class('item-new');
+                    cell.reveal_child = true;  // neighbours slide apart while it pops in
+                }
+            } else if (this.liveSibling(cell) !== previous) {
+                this.row.reorder_child_after(cell, previous);
+            }
+            previous = cell;
+        }
+    }
+
+    /** The entry before `cell`, skipping ones still shrinking away. */
+    liveSibling(cell) {
+        let sibling = cell.get_prev_sibling();
+        while (sibling && this.leaving.has(sibling))
+            sibling = sibling.get_prev_sibling();
+        return sibling;
+    }
+
+    /** Shrinks an entry away and closes the gap, then drops it. */
+    collapse(cell) {
+        this.leaving.add(cell);
+        cell.child.add_css_class('item-leaving');
+        cell.connect('notify::child-revealed', () => {
+            if (cell.child_revealed)
+                return;
+            this.leaving.delete(cell);
+            if (cell.get_parent() === this.row)
+                this.row.remove(cell);
+        });
+        cell.reveal_child = false;
+    }
+
+    /** Drops every entry widget, for when their texts must change (another language). */
+    rebuild() {
         let child;
         while ((child = this.row.get_first_child()))
             this.row.remove(child);
+        this.leaving.clear();
+        this.cells.clear();
         this.widgets.clear();
-        for (const e of this.items) {
-            const w = this.itemWidget(e);
-            this.widgets.set(key(e), w);
-            this.row.append(w);
+        this.filled = false;
+        this.itemsDirty = true;
+        this.render();
+    }
+
+    preview(e) {
+        if (e.kind === 'text') {
+            // A tiny page with the start of the text, like the Mac version.
+            return new Gtk.Label({
+                label: e.value.slice(0, 120),
+                wrap: true,
+                wrap_mode: Pango.WrapMode.WORD_CHAR,
+                xalign: 0,
+                yalign: 0,
+                width_request: 32,
+                height_request: 38,
+                halign: Gtk.Align.CENTER,
+                valign: Gtk.Align.CENTER,
+                overflow: Gtk.Overflow.HIDDEN,
+                css_classes: ['text-card'],
+            });
         }
+        const image = Gtk.Image.new_from_icon_name(e.kind === 'link' ? 'web-browser-symbolic' : 'text-x-generic');
+        image.pixel_size = 44;
+        if (e.kind === 'file')
+            loadPreview(e.value, image);
+        return image;
     }
 
     itemWidget(e) {
@@ -228,28 +451,16 @@ class ShelfWindow {
             css_classes: this.selected.has(key(e)) ? ['item', 'selected'] : ['item'],
             tooltip_text: e.value,
         });
-
-        let image;
-        if (e.kind === 'file') {
-            try {
-                const info = Gio.File.new_for_path(e.value).query_info('standard::icon,thumbnail::path', Gio.FileQueryInfoFlags.NONE, null);
-                const thumb = info.get_attribute_byte_string('thumbnail::path');
-                image = thumb ? Gtk.Image.new_from_file(thumb) : Gtk.Image.new_from_gicon(info.get_icon());
-            } catch {
-                image = Gtk.Image.new_from_icon_name('text-x-generic');
-            }
-        } else {
-            image = Gtk.Image.new_from_icon_name(e.kind === 'link' ? 'web-browser-symbolic' : 'text-x-generic');
-        }
-        image.pixel_size = 44;
+        const preview = this.preview(e);
         const label = new Gtk.Label({
-            label: title(e),
+            label: title(e, this.lang),
             ellipsize: Pango.EllipsizeMode.MIDDLE,
             max_width_chars: 9,
             css_classes: ['item-label'],
         });
-        box.append(image);
+        box.append(preview);
         box.append(label);
+        this.widgets.set(key(e), box);
 
         // Click selects, double-click opens (text is copied).
         const click = new Gtk.GestureClick();
@@ -261,14 +472,87 @@ class ShelfWindow {
         });
         box.add_controller(click);
 
+        // Right-click: the same menu as on the Mac.
+        const secondary = new Gtk.GestureClick({button: Gdk.BUTTON_SECONDARY});
+        secondary.connect('pressed', (_g, _n, x, y) => this.showMenu(e, box, x, y));
+        box.add_controller(secondary);
+
         // Dragging a selected entry carries the whole selection.
         const source = new Gtk.DragSource({actions: Gdk.DragAction.COPY});
         source.connect('prepare', () => this.provider(this.group(e)));
-        source.connect('drag-begin', s => s.set_icon(Gtk.WidgetPaintable.new(image), 22, 22));
+        source.connect('drag-begin', s => s.set_icon(Gtk.WidgetPaintable.new(preview), 22, 22));
         box.add_controller(source);
 
-        return box;
+        // An × in the corner while the mouse is over the entry.
+        const overlay = new Gtk.Overlay({child: box});
+        const remove = new Gtk.Button({
+            icon_name: 'window-close-symbolic',
+            css_classes: ['item-remove'],
+            halign: Gtk.Align.END,
+            valign: Gtk.Align.START,
+            visible: false,
+            tooltip_text: tr('removeFromShelf', this.lang),
+        });
+        remove.connect('clicked', () => this.remove(new Set([key(e)])));
+        overlay.add_overlay(remove);
+        const hover = new Gtk.EventControllerMotion();
+        hover.connect('enter', () => { remove.visible = true; });
+        hover.connect('leave', () => { remove.visible = false; });
+        overlay.add_controller(hover);
+        return overlay;
     }
+
+    // MARK: Item menu
+
+    buildMenu() {
+        const actions = new Gio.SimpleActionGroup();
+        const add = (name, fn) => {
+            const action = new Gio.SimpleAction({name});
+            action.connect('activate', () => fn(this.menuEntries));
+            actions.add_action(action);
+        };
+        add('open', entries => entries.forEach(e => this.open(e)));
+        add('reveal', entries => this.reveal(entries[0]));
+        add('copy', entries => this.copy(entries));
+        add('select-all', () => this.setSelection(this.items.map(key)));
+        add('deselect', () => this.setSelection([]));
+        add('remove', entries => this.remove(new Set(entries.map(key))));
+        this.win.insert_action_group('shelf', actions);
+
+        // One popover for every entry, pointed at the one that was right-clicked.
+        this.menu = new Gtk.PopoverMenu({has_arrow: false});
+        this.menu.set_parent(this.root);
+    }
+
+    showMenu(e, widget, x, y) {
+        const t = (k, n) => tr(k, this.lang, n);
+        const group = this.group(e);
+        const many = group.length > 1;
+        this.menuEntries = group;
+
+        const main = new Gio.Menu();
+        main.append(many ? t('openN', group.length) : e.kind === 'text' ? t('copyText') : t('open'), 'shelf.open');
+        if (e.kind === 'file' && !many)
+            main.append(t('showInFolder'), 'shelf.reveal');
+        main.append(many ? t('copyN', group.length) : t('copy'), 'shelf.copy');
+        const selection = new Gio.Menu();
+        if (this.selected.size < this.items.length)
+            selection.append(t('selectAll'), 'shelf.select-all');
+        if (this.selected.size)
+            selection.append(t('deselect'), 'shelf.deselect');
+        const removal = new Gio.Menu();
+        removal.append(many ? t('removeN', group.length) : t('removeFromShelf'), 'shelf.remove');
+        const model = new Gio.Menu();
+        for (const section of [main, selection, removal])
+            model.append_section(null, section);
+        this.menu.set_menu_model(model);
+
+        const [, at] = widget.compute_point(this.root, new Graphene.Point({x, y}));
+        this.menu.set_pointing_to(new Gdk.Rectangle({x: Math.round(at.x), y: Math.round(at.y), width: 1, height: 1}));
+        this.menu.popup();
+    }
+
+    // MARK: Actions
 
     group(e) {
         return this.selected.has(key(e)) ? this.items.filter(i => this.selected.has(key(i))) : [e];
@@ -302,21 +586,57 @@ class ShelfWindow {
         this.render();
     }
 
+    setSelection(keys) {
+        this.selected = new Set(keys);
+        for (const [k, w] of this.widgets) {
+            if (this.selected.has(k))
+                w.add_css_class('selected');
+            else
+                w.remove_css_class('selected');
+        }
+        this.render();
+    }
+
     open(e) {
         if (e.kind === 'text') {
-            this.win.get_clipboard().set_content(Gdk.ContentProvider.new_for_value(stringValue(e.value)));
+            this.copy([e]);
             return;
         }
         const uri = e.kind === 'file' ? Gio.File.new_for_path(e.value).get_uri() : e.value;
         Gio.AppInfo.launch_default_for_uri(uri, null);
     }
 
+    /** Copies files as files (paste into Files) and as text (paste into a chat box). */
+    copy(entries) {
+        this.win.get_clipboard().set_content(entries.length === 1 && entries[0].kind === 'text'
+            ? Gdk.ContentProvider.new_for_value(stringValue(entries[0].value))
+            : this.provider(entries));
+    }
+
+    /** Opens the file manager with the file selected (Files, Nemo, Dolphin… all speak this). */
+    reveal(e) {
+        const file = Gio.File.new_for_path(e.value);
+        Gio.DBus.session.call('org.freedesktop.FileManager1', '/org/freedesktop/FileManager1',
+            'org.freedesktop.FileManager1', 'ShowItems', new GLib.Variant('(ass)', [[file.get_uri()], '']),
+            null, Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
+                try {
+                    conn.call_finish(res);
+                } catch {
+                    // No file manager on the bus: at least open the folder.
+                    Gio.AppInfo.launch_default_for_uri(file.get_parent().get_uri(), null);
+                }
+            });
+    }
+
+    remove(keys) {
+        this.items = this.items.filter(i => !keys.has(key(i)));
+        keys.forEach(k => this.selected.delete(k));
+        this.commit();
+    }
+
+    /** With a selection the trash removes just that, otherwise everything. */
     clear() {
-        this.items = this.selected.size ? this.items.filter(i => !this.selected.has(key(i))) : [];
-        this.selected.clear();
-        save(this.items);
-        this.itemsDirty = true;
-        this.render();
+        this.remove(this.selected.size ? new Set(this.selected) : new Set(this.items.map(key)));
     }
 
     show(peek) {
@@ -327,7 +647,14 @@ class ShelfWindow {
             this.itemsDirty = true;
         }
         this.render();
+        const appearing = !this.win.visible;
         this.win.present();
+        if (appearing) {
+            // A new animation name restarts it, so alternate between two identical ones.
+            this.appearFlip = !this.appearFlip;
+            this.root.remove_css_class(this.appearFlip ? 'appear-b' : 'appear-a');
+            this.root.add_css_class(this.appearFlip ? 'appear-a' : 'appear-b');
+        }
         if (peek) {
             this.scheduleHide(4000);
         } else if (this.hideId) {
@@ -342,7 +669,7 @@ class ShelfWindow {
             GLib.source_remove(this.hideId);
         this.hideId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
             this.hideId = 0;
-            if (this.pointerInside || this.hovering)
+            if (this.pointerInside || this.hovering || this.menu.visible)
                 this.scheduleHide(1200);
             else
                 this.win.set_visible(false);
@@ -373,9 +700,22 @@ app.connect('startup', () => {
     }
 });
 
+// Idle and the extension's own "quit" can both arrive; the hold must be released once.
+let quitting = false;
+function quit() {
+    if (quitting)
+        return;
+    quitting = true;
+    app.release();
+    app.quit();
+}
+
 function handle(cmd, lang) {
-    shelf ??= new ShelfWindow(app, resolveLang(lang));
-    shelf.lang = resolveLang(lang);
+    shelf ??= new ShelfWindow(app, resolveLang(lang), quit);
+    if (shelf.lang !== resolveLang(lang)) {
+        shelf.lang = resolveLang(lang);
+        shelf.rebuild();
+    }
     switch (cmd) {
     case 'start':
         // Just get ready (window built, nothing shown) so the first peek is instant.
@@ -393,8 +733,7 @@ function handle(cmd, lang) {
             shelf.show(false);
         break;
     case 'quit':
-        app.release();
-        app.quit();
+        quit();
         break;
     default:
         shelf.show(false);

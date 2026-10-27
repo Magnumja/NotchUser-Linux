@@ -12,6 +12,7 @@
   border-radius: 99px;
   background-color: rgba(0, 0, 0, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.10);
+  transition-duration: 200ms; /* the hover rim fades in instead of snapping */
 }
 
 .notchuser-indicator:hover .notchuser-pill,

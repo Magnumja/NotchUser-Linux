@@ -14,15 +14,16 @@
 ## O que ele faz
 
 - **Pílula estilo notch no meio da barra de cima**, ao lado do relógio: capa, nome da música e **barrinhas animadas na cor do álbum**, como no Mac. Some quando nada está tocando.
+- **Transições suaves**: a pílula cresce um pouco sob o mouse e o painel "brota" dela como uma nuvem (escala a partir da pílula, com o conteúdo entrando em cascata), e volta para dentro dela ao fechar. A prateleira aparece do mesmo jeito; itens novos entram com um saltinho e os removidos encolhem enquanto os vizinhos fecham o espaço. Tudo segue o ajuste de animações do GNOME.
 - **Passe o mouse para abrir** (ou clique) um painel escuro e translúcido, **tingido com a cor da capa**: capa, artista, barra de progresso (dá para arrastar) e controles. Ele fecha sozinho quando o mouse sai.
 - **"Pulinho"** na pílula quando a música troca, e uma **tremidinha** quando algo chega na prateleira.
-- **Prateleira.** Arraste arquivos, links ou texto em direção à barra de cima: uma prateleira de vidro aparece logo abaixo da pílula com "Solte aqui pra guardar". Depois é só arrastar de volta para onde quiser. Clique para selecionar vários e arrastar todos juntos; dois cliques abrem (texto é copiado). Também abre pelo ícone de pasta no painel.
+- **Prateleira.** Arraste arquivos, links ou texto em direção à barra de cima: uma prateleira de vidro aparece logo abaixo da pílula com "Solte aqui pra guardar". Depois é só arrastar de volta para onde quiser. Clique para selecionar vários e arrastar todos juntos; dois cliques abrem (texto é copiado). O botão direito tem abrir, mostrar na pasta, copiar, selecionar tudo e tirar da prateleira; o × no canto tira um item só. Arquivos aparecem com miniatura, e os que foram apagados ou movidos saem sozinhos. Também abre pelo ícone de pasta no painel.
 - **Vidro fosco de verdade**: o painel e a prateleira desfocam o que está atrás, com o mesmo efeito da Visão Geral do GNOME (dá para desligar nos Ajustes).
 - **Clique do meio** na pílula: play/pause sem abrir nada.
 - **Funciona com qualquer player MPRIS**: Spotify, Firefox, Chrome/Chromium, VLC, Rhythmbox, Elisa…
 - **Vários players ao mesmo tempo**: mostra o que começou a tocar por último; os ícones ao lado dos controles deixam trocar.
-- **Ajustes** (engrenagem no painel, ou app Extensões): idioma (Sistema, Português, English, Español), abrir ao passar o mouse, mostrar o nome na pílula e o pulinho.
-- **Leve**: a posição da música só é consultada com o painel aberto, e as barrinhas só animam enquanto toca.
+- **Ajustes** (engrenagem no painel, ou app Extensões): idioma (Sistema, Português, English, Español), abrir ao passar o mouse, mostrar o nome na pílula, animar as barrinhas e o pulinho.
+- **Leve**: a posição da música só é consultada com o painel aberto; as barrinhas só animam enquanto toca (e ficam paradas se as animações do GNOME estiverem desligadas, na Visão Geral, em tela cheia ou com a tela bloqueada); a prateleira se encerra sozinha depois de 5 minutos escondida e nunca lê o disco travando a barra de cima.
 
 Requisitos: GNOME 45 a 50 (Ubuntu 24.04 ou mais novo, Fedora 39+, …).
 
